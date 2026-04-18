@@ -1,0 +1,22 @@
+[package]
+name = "android_system_vmtethering"
+version = "0.1.0"
+edition = "2021"
+description = "Rust bindings for Android Virtualization AIDL interfaces"
+license = "Apache-2.0"
+
+[lib]
+name = "android_system_vmtethering"
+path = "android_system_vmtethering.rs"
+
+[dependencies]
+binder = { path = "../../../../../../../../../frameworks/native/libs/binder/rust" }
+android_system_virtualizationcommon = { path = "../virtualizationcommon" }
+async-trait = "0.1.74"
+
+[features]
+default = []
+
+[profile.release]
+lto = true
+opt-level = "z"

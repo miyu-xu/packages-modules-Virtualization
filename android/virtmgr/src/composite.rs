@@ -14,14 +14,45 @@
 
 //! Functions for creating a composite disk image.
 
+#[cfg(unix)]
+use crate::os_compat::AsRawFd;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::Partition::Partition;
 use anyhow::{bail, Context, Error};
 use disk::{create_composite_disk, ImagePartitionType, PartitionInfo};
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
-use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::ffi::OsString;
+
+fn read_exact_at_compat(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut off = 0usize;
+        while off < buf.len() {
+            let n = file.seek_read(&mut buf[off..], offset + off as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF",
+                ));
+            }
+            off += n;
+        }
+        Ok(())
+    }
+}
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
 use zerocopy::FromZeroes;
@@ -62,10 +93,10 @@ pub fn make_composite_image(
 
     create_composite_disk(
         &partitions,
-        &fd_path_for_file(&zero_filler_file),
-        &fd_path_for_file(&header_file),
+        &path_for_file(&zero_filler_file)?,
+        &path_for_file(&header_file)?,
         &mut header_file,
-        &fd_path_for_file(&footer_file),
+        &path_for_file(&footer_file)?,
         &mut footer_file,
         &mut composite_image,
     )?;
@@ -100,7 +131,7 @@ fn convert_partitions(partitions: &[Partition]) -> Result<(Vec<PartitionInfo>, V
                 .try_clone()
                 .context("Failed to clone partition image file descriptor")?
                 .into();
-            let path = fd_path_for_file(&file);
+            let path = path_for_file(&file)?;
             let size = get_partition_size(&file)?;
             files.push(file);
 
@@ -118,9 +149,26 @@ fn convert_partitions(partitions: &[Partition]) -> Result<(Vec<PartitionInfo>, V
     Ok((partitions, files))
 }
 
-fn fd_path_for_file(file: &File) -> PathBuf {
-    let fd = file.as_raw_fd();
-    format!("/proc/self/fd/{}", fd).into()
+fn path_for_file(file: &File) -> Result<PathBuf, Error> {
+    #[cfg(unix)]
+    {
+        let fd = file.as_raw_fd();
+        return Ok(format!("/proc/self/fd/{}", fd).into());
+    }
+    #[cfg(windows)]
+    {
+        let h = file.as_raw_handle();
+        let mut buf = vec![0u16; 32768];
+        let len = unsafe { GetFinalPathNameByHandleW(h as _, buf.as_mut_ptr(), buf.len() as u32, 0) };
+        if len == 0 {
+            bail!(
+                "GetFinalPathNameByHandleW failed for composite input: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let os_str = OsString::from_wide(&buf[..len as usize]);
+        Ok(PathBuf::from(os_str))
+    }
 }
 
 /// Find the size of the partition image in the given file by parsing the header.
@@ -145,7 +193,7 @@ fn get_partition_size(file: &File) -> Result<u64, Error> {
                 image_checksum: u32,
             }
             let mut header = SparseHeader::new_zeroed();
-            file.read_exact_at(header.as_bytes_mut(), 0)
+            read_exact_at_compat(file, header.as_bytes_mut(), 0)
                 .context("failed to read android sparse header")?;
             let len = u64::from(header.total_blks)
                 .checked_mul(header.blk_sz.into())
@@ -172,7 +220,7 @@ fn detect_image_type(file: &File) -> std::io::Result<ImageType> {
     const SPARSE_HEADER_MAGIC: u32 = 0xed26ff3a;
 
     let mut magic4 = [0u8; 4];
-    match file.read_exact_at(&mut magic4[..], 0) {
+    match read_exact_at_compat(file, &mut magic4[..], 0) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(ImageType::Raw),
         Err(e) => return Err(e),
@@ -185,7 +233,7 @@ fn detect_image_type(file: &File) -> std::io::Result<ImageType> {
     }
 
     let mut buf = [0u8; CDISK_MAGIC.len()];
-    match file.read_exact_at(buf.as_bytes_mut(), 0) {
+    match read_exact_at_compat(file, buf.as_bytes_mut(), 0) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(ImageType::Raw),
         Err(e) => return Err(e),

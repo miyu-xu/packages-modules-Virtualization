@@ -31,11 +31,37 @@ use create_idsig::command_create_idsig;
 use create_partition::command_create_partition;
 use run::{command_run, command_run_app, command_run_microdroid};
 use serde::Serialize;
-use std::io::{self, IsTerminal};
+use std::io;
+#[cfg(unix)]
+use std::io::IsTerminal;
+#[cfg(windows)]
+use std::io::{BufRead, Seek, SeekFrom, Write};
 use std::num::NonZeroU16;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::fs::OpenOptions;
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Command;
+#[cfg(windows)]
+use std::thread;
+#[cfg(windows)]
+use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+const WINDOWS_FILE_CONSOLE_PREFIX: &str = "win-file-console|";
+
+struct ConnectedService {
+    _virtmgr: vmclient::VirtualizationService,
+    service: Strong<dyn IVirtualizationService>,
+}
+
+impl ConnectedService {
+    fn as_ref(&self) -> &dyn IVirtualizationService {
+        self.service.as_ref()
+    }
+}
 
 #[derive(Args, Default)]
 /// Collection of flags that are at VM level and therefore applicable to all subcommands
@@ -110,6 +136,11 @@ pub struct DebugConfig {
     #[arg(long)]
     gdb: Option<NonZeroU16>,
 
+    /// Listen on localhost:<port> and bridge accepted TCP clients to guest vsock:5555.
+    #[cfg(windows)]
+    #[arg(long)]
+    adb_tcp_port: Option<NonZeroU16>,
+
     /// Whether to enable earlycon. Only supported for debuggable Linux-based VMs.
     #[cfg(debuggable_vms_improvements)]
     #[arg(long)]
@@ -123,6 +154,16 @@ impl DebugConfig {
                 self.enable_earlycon
             } else {
                 false
+            }
+        }
+    }
+
+    fn adb_tcp_port(&self) -> Option<u16> {
+        cfg_if::cfg_if! {
+            if #[cfg(windows)] {
+                self.adb_tcp_port.map(NonZeroU16::get)
+            } else {
+                None
             }
         }
     }
@@ -349,6 +390,16 @@ enum Opt {
     Console {
         /// CID of the VM
         cid: Option<i32>,
+
+        /// Exit after reading console output for the given number of seconds.
+        #[cfg(windows)]
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+
+        /// Do not forward local stdin into the VM console input file.
+        #[cfg(windows)]
+        #[arg(long)]
+        read_only: bool,
     },
 }
 
@@ -376,10 +427,11 @@ fn parse_cpu_topology(s: &str) -> Result<CpuTopology, String> {
     }
 }
 
-fn get_service() -> Result<Strong<dyn IVirtualizationService>, Error> {
+fn get_service() -> Result<ConnectedService, Error> {
     let virtmgr =
         vmclient::VirtualizationService::new().context("Failed to spawn VirtualizationService")?;
-    virtmgr.connect().context("Failed to connect to VirtualizationService")
+    let service = virtmgr.connect().context("Failed to connect to VirtualizationService")?;
+    Ok(ConnectedService { _virtmgr: virtmgr, service })
 }
 
 fn command_check_feature_enabled(feature: &str) {
@@ -393,8 +445,11 @@ fn main() -> Result<(), Error> {
     env_logger::init();
     let opt = Opt::parse();
 
-    // We need to start the thread pool for Binder to work properly, especially link_to_death.
-    ProcessState::start_thread_pool();
+    #[cfg(not(windows))]
+    {
+        // We need to start the thread pool for Binder to work properly, especially link_to_death.
+        ProcessState::start_thread_pool();
+    }
 
     match opt {
         Opt::CheckFeatureEnabled { feature } => {
@@ -404,15 +459,37 @@ fn main() -> Result<(), Error> {
         Opt::RunApp { config } => command_run_app(config),
         Opt::RunMicrodroid { config } => command_run_microdroid(config),
         Opt::Run { config } => command_run(config),
-        Opt::List => command_list(get_service()?.as_ref()),
+        Opt::List => {
+            let service = get_service()?;
+            command_list(service.as_ref())
+        }
         Opt::Info => command_info(),
         Opt::CreatePartition { path, size, partition_type } => {
-            command_create_partition(get_service()?.as_ref(), &path, size, partition_type)
+            let service = get_service()?;
+            command_create_partition(service.as_ref(), &path, size, partition_type)
         }
         Opt::CreateIdsig { apk, path } => {
-            command_create_idsig(get_service()?.as_ref(), &apk, &path)
+            let service = get_service()?;
+            command_create_idsig(service.as_ref(), &apk, &path)
         }
-        Opt::Console { cid } => command_console(cid),
+        Opt::Console {
+            cid,
+            #[cfg(windows)]
+            timeout_secs,
+            #[cfg(windows)]
+            read_only,
+        } => {
+            #[cfg(windows)]
+            {
+                command_console(cid, timeout_secs, read_only)
+            }
+            #[cfg(unix)]
+            {
+                let _ = timeout_secs;
+                let _ = read_only;
+                command_console(cid)
+            }
+        }
     }
 }
 
@@ -440,22 +517,30 @@ fn command_info() -> Result<(), Error> {
         println!("Hypervisor version not set.");
     }
 
-    if Path::new("/dev/kvm").exists() {
-        println!("/dev/kvm exists.");
-    } else {
-        println!("/dev/kvm does not exist.");
-    }
+    #[cfg(unix)]
+    {
+        use std::path::Path;
+        if Path::new("/dev/kvm").exists() {
+            println!("/dev/kvm exists.");
+        } else {
+            println!("/dev/kvm does not exist.");
+        }
 
-    if Path::new("/dev/vfio/vfio").exists() {
-        println!("/dev/vfio/vfio exists.");
-    } else {
-        println!("/dev/vfio/vfio does not exist.");
-    }
+        if Path::new("/dev/vfio/vfio").exists() {
+            println!("/dev/vfio/vfio exists.");
+        } else {
+            println!("/dev/vfio/vfio does not exist.");
+        }
 
-    if Path::new("/sys/bus/platform/drivers/vfio-platform").exists() {
-        println!("VFIO-platform is supported.");
-    } else {
-        println!("VFIO-platform is not supported.");
+        if Path::new("/sys/bus/platform/drivers/vfio-platform").exists() {
+            println!("VFIO-platform is supported.");
+        } else {
+            println!("VFIO-platform is not supported.");
+        }
+    }
+    #[cfg(windows)]
+    {
+        println!("Linux device nodes (/dev/kvm, /dev/vfio/vfio, VFIO-platform sysfs): not applicable on Windows.");
     }
 
     #[derive(Serialize)]
@@ -464,24 +549,27 @@ fn command_info() -> Result<(), Error> {
         dtbo_label: String,
     }
 
-    let devices = get_service()?.getAssignableDevices()?;
+    let service = get_service()?;
+    let devices = service.as_ref().getAssignableDevices()?;
     let devices: Vec<_> = devices
         .into_iter()
         .map(|device| AssignableDevice { node: device.node, dtbo_label: device.dtbo_label })
         .collect();
     println!("Assignable devices: {}", serde_json::to_string(&devices)?);
 
-    let os_list = get_service()?.getSupportedOSList()?;
+    let os_list = service.as_ref().getSupportedOSList()?;
     println!("Available OS list: {}", serde_json::to_string(&os_list)?);
 
     Ok(())
 }
 
+#[cfg(unix)]
 fn command_console(cid: Option<i32>) -> Result<(), Error> {
     if !io::stdin().is_terminal() {
         bail!("Stdin must be a terminal (tty). Use 'adb shell -t' to force allocate tty.");
     }
-    let mut vms = get_service()?.debugListVms().context("Failed to get list of VMs")?;
+    let service = get_service()?;
+    let mut vms = service.as_ref().debugListVms().context("Failed to get list of VMs")?;
     if let Some(cid) = cid {
         vms.retain(|vm_info| vm_info.cid == cid);
     }
@@ -490,6 +578,129 @@ fn command_console(cid: Option<i32>) -> Result<(), Error> {
         .find_map(|vm_info| vm_info.hostConsoleName)
         .context("Failed to get VM with console")?;
     Err(Command::new("microcom").arg(host_console_name).exec().into())
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsConsoleInfo {
+    output_path: PathBuf,
+    input_path: Option<PathBuf>,
+}
+
+#[cfg(windows)]
+fn parse_windows_console_info(raw: Option<String>, temp_dir: &str) -> Option<WindowsConsoleInfo> {
+    if let Some(raw) = raw {
+        if let Some(rest) = raw.strip_prefix(WINDOWS_FILE_CONSOLE_PREFIX) {
+            let mut parts = rest.splitn(2, '|');
+            let output = parts.next()?.trim();
+            if output.is_empty() {
+                return None;
+            }
+            let input = parts.next().map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from);
+            return Some(WindowsConsoleInfo { output_path: PathBuf::from(output), input_path: input });
+        }
+
+        if !raw.trim().is_empty() {
+            return Some(WindowsConsoleInfo { output_path: PathBuf::from(raw), input_path: None });
+        }
+    }
+
+    let output_path = PathBuf::from(temp_dir).join("guest-virtio-console1.txt");
+    if output_path.exists() {
+        return Some(WindowsConsoleInfo { output_path, input_path: None });
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn forward_console_input(input_path: PathBuf) {
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut locked = stdin.lock();
+        loop {
+            let mut line = String::new();
+            match locked.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Ok(mut file) =
+                        OpenOptions::new().create(true).append(true).open(&input_path)
+                    {
+                        let _ = file.write_all(line.as_bytes());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+#[cfg(windows)]
+fn tail_console_output(output_path: &PathBuf, timeout_secs: Option<u64>) -> Result<(), Error> {
+    let deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
+    let mut offset = 0u64;
+
+    loop {
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+
+        if let Ok(mut file) = OpenOptions::new().read(true).open(output_path) {
+            file.seek(SeekFrom::Start(offset))
+                .with_context(|| format!("Failed to seek console file {:?}", output_path))?;
+            let mut buf = Vec::new();
+            let bytes_read = std::io::Read::read_to_end(&mut file, &mut buf)
+                .with_context(|| format!("Failed to read console file {:?}", output_path))?;
+            if bytes_read > 0 {
+                offset += bytes_read as u64;
+                print!("{}", String::from_utf8_lossy(&buf));
+                io::stdout().flush().context("Failed to flush console output")?;
+            }
+        }
+
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn command_console(cid: Option<i32>, timeout_secs: Option<u64>, read_only: bool) -> Result<(), Error> {
+    #[cfg(windows)]
+    {
+        let service = get_service()?;
+        let mut vms = service.as_ref().debugListVms().context("Failed to get list of VMs")?;
+        if let Some(cid) = cid {
+            vms.retain(|vm_info| vm_info.cid == cid);
+        }
+        let vm_info = match vms.len() {
+            0 => bail!("Failed to get VM with console"),
+            1 => vms.remove(0),
+            _ => {
+                let cids: Vec<_> = vms.iter().map(|vm| vm.cid).collect();
+                bail!("Multiple VMs are running; specify a CID with `vm console <cid>`. Available CIDs: {:?}", cids);
+            }
+        };
+
+        let console = parse_windows_console_info(vm_info.hostConsoleName, &vm_info.temporaryDirectory)
+            .context("Failed to resolve Windows console paths for the VM")?;
+
+        eprintln!("Connecting to Windows VM console for CID {}", vm_info.cid);
+        eprintln!("Console output: {}", console.output_path.display());
+        if let Some(input_path) = &console.input_path {
+            eprintln!("Console input : {}", input_path.display());
+        }
+
+        if !read_only {
+            if let Some(input_path) = console.input_path.clone() {
+                forward_console_input(input_path);
+            }
+        }
+
+        tail_console_output(&console.output_path, timeout_secs)
+    }
 }
 
 #[cfg(test)]

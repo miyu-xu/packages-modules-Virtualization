@@ -16,7 +16,6 @@
 
 use anyhow::{anyhow, Result};
 use cstr::cstr;
-use fsfdt::FsFdt;
 use libfdt::{Fdt, FdtError};
 use std::ffi::CStr;
 use std::path::Path;
@@ -49,6 +48,7 @@ pub(crate) const VM_DT_OVERLAY_MAX_SIZE: usize = 2000;
 ///     };
 /// };
 /// ```
+#[cfg(unix)]
 pub(crate) fn create_device_tree_overlay<'a>(
     buffer: &'a mut [u8],
     dt_path: Option<&'a Path>,
@@ -125,7 +125,17 @@ pub(crate) fn create_device_tree_overlay<'a>(
     Ok(fdt)
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+pub(crate) fn create_device_tree_overlay<'a>(
+    _buffer: &'a mut [u8],
+    _dt_path: Option<&'a Path>,
+    _untrusted_props: &[(&'a CStr, &'a [u8])],
+    _trusted_props: &[(&'a CStr, &'a [u8])],
+) -> Result<&'a mut Fdt> {
+    Err(anyhow!("device tree overlay is not supported on Windows host builds"))
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

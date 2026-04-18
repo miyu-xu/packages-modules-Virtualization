@@ -34,8 +34,8 @@ use std::fs::{read_to_string, File};
 use std::io::{self, Read};
 use std::mem;
 use std::num::{NonZeroU16, NonZeroU32};
-use std::os::unix::io::{AsRawFd, OwnedFd};
-use std::os::unix::process::ExitStatusExt;
+use crate::os_compat::{AsRawFd, ExitStatusExt, IntoRawFd};
+use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::{Arc, Condvar, Mutex, LazyLock};
@@ -388,6 +388,7 @@ pub struct VmInstance {
     payload_state: Mutex<PayloadState>,
     /// Represents the condition that payload_state was updated
     payload_state_updated: Condvar,
+    host_console_name: Mutex<Option<String>>,
     /// The human readable name of requester_uid
     requester_uid_name: String,
 }
@@ -435,6 +436,7 @@ impl VmInstance {
             vm_metric: Mutex::new(Default::default()),
             payload_state: Mutex::new(PayloadState::Starting),
             payload_state_updated: Condvar::new(),
+            host_console_name: Mutex::new(None),
             requester_uid_name,
         };
         info!("{} created", &instance);
@@ -451,6 +453,14 @@ impl VmInstance {
             info!("{} started", &self);
         }
         ret.with_context(|| format!("{} failed to start", &self))
+    }
+
+    pub fn host_console_name(&self) -> Option<String> {
+        self.host_console_name.lock().unwrap().clone()
+    }
+
+    pub fn remember_host_console_name(&self, host_console_name: &str) {
+        *self.host_console_name.lock().unwrap() = Some(host_console_name.to_owned());
     }
 
     /// Monitors the exit of the VM (i.e. termination of the `child` process). When that happens,

@@ -14,11 +14,14 @@
 
 //! Wrapper to libselinux
 
+#[cfg(windows)]
+use crate::os_compat::AsRawFd;
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::io;
 use std::ops::Deref;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::os::raw::c_char;
 use std::ptr;

@@ -20,6 +20,8 @@ use crate::composite::make_composite_image;
 use crate::crosvm::{AudioConfig, CrosvmConfig, DiskFile, DisplayConfig, GpuConfig, InputDeviceOption, PayloadState, UsbConfig, VmContext, VmInstance, VmState};
 use crate::debug_config::DebugConfig;
 use crate::dt_overlay::{create_device_tree_overlay, VM_DT_OVERLAY_MAX_SIZE, VM_DT_OVERLAY_PATH};
+#[cfg(windows)]
+use crate::host_internal_service;
 use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images, add_microdroid_vendor_image};
 use crate::selinux::{getfilecon, SeContext};
 use android_os_permissions_aidl::aidl::android::os::IPermissionController;
@@ -70,8 +72,9 @@ use cstr::cstr;
 use glob::glob;
 use log::{debug, error, info, warn};
 use microdroid_payload_config::{ApkConfig, Task, TaskType, VmPayloadConfig};
+#[cfg(unix)]
 use nix::unistd::pipe;
-use rpcbinder::RpcServer;
+use rpcbinder::{FileDescriptorTransportMode, RpcServer};
 use rustutils::system_properties;
 use semver::VersionReq;
 use serde::Deserialize;
@@ -84,19 +87,23 @@ use std::io::{BufRead, BufReader, Error, ErrorKind, Seek, SeekFrom, Write};
 use std::iter;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::Range;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-use std::os::unix::raw::pid_t;
+#[cfg(unix)]
+use crate::os_compat::{AsRawFd, FromRawFd, IntoRawFd};
+use crate::os_compat::pid_t;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak, LazyLock};
+#[cfg(windows)]
+use std::sync::Once;
 use vbmeta::VbMetaImage;
-use vmconfig::{VmConfig, get_debug_level};
-use vsock::VsockStream;
+use vmconfig::{VmConfig, get_debug_level, resolve_host_path};
 use zip::ZipArchive;
 
 /// The unique ID of a VM used (together with a port number) for vsock communication.
 pub type Cid = u32;
 
 pub const BINDER_SERVICE_IDENTIFIER: &str = "android.system.virtualizationservice";
+#[cfg(windows)]
+const VIRTMGR_TRACE_FILE: &str = "VIRTMGR_TRACE_FILE";
 
 /// The size of zero.img.
 /// Gaps in composite disk images are filled with a shared zero.img.
@@ -107,6 +114,20 @@ const ANDROID_VM_INSTANCE_MAGIC: &str = "Android-VM-instance";
 
 /// Version of the instance image format
 const ANDROID_VM_INSTANCE_VERSION: u16 = 1;
+
+#[cfg(windows)]
+pub(crate) fn debug_trace(message: impl AsRef<str>) {
+    let Ok(path) = std::env::var(VIRTMGR_TRACE_FILE) else {
+        return;
+    };
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{}", message.as_ref());
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn debug_trace(_message: impl AsRef<str>) {}
 
 const MICRODROID_OS_NAME: &str = "microdroid";
 
@@ -124,6 +145,8 @@ pub static GLOBAL_SERVICE: LazyLock<Strong<dyn IVirtualizationServiceInternal>> 
     LazyLock::new(|| {
         if cfg!(early) {
             panic!("Early virtmgr must not connect to VirtualizatinoServiceInternal")
+        } else if cfg!(windows) {
+            host_internal_service::global_service()
         } else {
             wait_for_interface(BINDER_SERVICE_IDENTIFIER)
                 .expect("Could not connect to VirtualizationServiceInternal")
@@ -136,16 +159,29 @@ fn create_or_update_idsig_file(
     input_fd: &ParcelFileDescriptor,
     idsig_fd: &ParcelFileDescriptor,
 ) -> Result<()> {
+    println!("virtmgr: idsig helper enter");
+    println!("virtmgr: idsig before clone input");
     let mut input = clone_file(input_fd)?;
+    println!("virtmgr: idsig after clone input");
     let metadata = input.metadata().context("failed to get input metadata")?;
+    println!("virtmgr: idsig after input metadata len={}", metadata.len());
     if !metadata.is_file() {
         bail!("input is not a regular file");
     }
-    let mut sig =
-        V4Signature::create(&mut input, get_current_sdk()?, 4096, &[], HashAlgorithm::SHA256)
-            .context("failed to create idsig")?;
+    println!("virtmgr: idsig before V4Signature::create");
+    let mut sig = V4Signature::create(&mut input, 4096, &[], HashAlgorithm::SHA256)
+        .context("failed to create idsig")?;
+    println!("virtmgr: idsig after V4Signature::create");
 
+    println!("virtmgr: idsig before clone output");
     let mut output = clone_file(idsig_fd)?;
+    println!("virtmgr: idsig after clone output");
+    #[cfg(windows)]
+    debug_trace(format!(
+        "virtmgr: idsig before input_len={} output_len={}",
+        metadata.len(),
+        output.metadata()?.len()
+    ));
 
     // Optimization. We don't have to update idsig file whenever a VM is started. Don't update it,
     // if the idsig file already has the same APK digest.
@@ -164,7 +200,14 @@ fn create_or_update_idsig_file(
         .seek(SeekFrom::Start(0))
         .context("failed to move cursor to start on the idsig output")?;
     output.set_len(0).context("failed to set_len on the idsig output")?;
+    println!("virtmgr: idsig before write_into");
     sig.write_into(&mut output).context("failed to write idsig")?;
+    println!("virtmgr: idsig after write_into");
+    #[cfg(windows)]
+    debug_trace(format!(
+        "virtmgr: idsig after output_len={}",
+        output.metadata()?.len()
+    ));
     Ok(())
 }
 
@@ -175,6 +218,14 @@ fn get_current_sdk() -> Result<u32> {
 }
 
 pub fn remove_temporary_files(path: &PathBuf) -> Result<()> {
+    #[cfg(windows)]
+    if std::env::var("VIRTMGR_KEEP_TEMP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        debug_trace(format!("virtmgr: keeping temp files at {}", path.display()));
+        return Ok(());
+    }
     for dir_entry in read_dir(path)? {
         remove_file(dir_entry?.path())?;
     }
@@ -222,6 +273,8 @@ impl IVirtualizationService for VirtualizationService {
         console_in_fd: Option<&ParcelFileDescriptor>,
         log_fd: Option<&ParcelFileDescriptor>,
     ) -> binder::Result<Strong<dyn IVirtualMachine>> {
+        debug_trace("virtmgr: createVm enter");
+        println!("virtmgr: createVm enter");
         let mut is_protected = false;
         let ret = self.create_vm_internal(
             config,
@@ -230,6 +283,8 @@ impl IVirtualizationService for VirtualizationService {
             log_fd,
             &mut is_protected,
         );
+        debug_trace(format!("virtmgr: createVm exit ok={}", ret.is_ok()));
+        println!("virtmgr: createVm exit ok={}", ret.is_ok());
         write_vm_creation_stats(config, is_protected, &ret);
         ret
     }
@@ -290,25 +345,48 @@ impl IVirtualizationService for VirtualizationService {
     ) -> binder::Result<()> {
         check_manage_access()?;
 
+        println!("virtmgr: createOrUpdateIdsigFile enter");
         create_or_update_idsig_file(input_fd, idsig_fd).or_service_specific_exception(-1)?;
+        println!("virtmgr: createOrUpdateIdsigFile exit");
         Ok(())
     }
 
     /// Get a list of all currently running VMs. This method is only intended for debug purposes,
     /// and as such is only permitted from the shell user.
     fn debugListVms(&self) -> binder::Result<Vec<VirtualMachineDebugInfo>> {
-        // Delegate to the global service, including checking the debug permission.
-        GLOBAL_SERVICE.debugListVms()
+        #[cfg(windows)]
+        {
+            check_manage_access()?;
+            let state = self.state.lock().unwrap();
+            return Ok(state
+                .vms()
+                .into_iter()
+                .map(|vm| VirtualMachineDebugInfo {
+                    cid: vm.cid as i32,
+                    temporaryDirectory: vm.temporary_directory.to_string_lossy().into_owned(),
+                    requesterUid: vm.requester_uid as i32,
+                    requesterPid: vm.requester_debug_pid,
+                    hostConsoleName: vm.host_console_name(),
+                })
+                .collect());
+        }
+        #[cfg(not(windows))]
+        {
+            // Delegate to the global service, including checking the debug permission.
+            GLOBAL_SERVICE.debugListVms()
+        }
     }
 
     /// Get a list of assignable device types.
     fn getAssignableDevices(&self) -> binder::Result<Vec<AssignableDevice>> {
+        eprintln!("virtmgr: getAssignableDevices");
         // Delegate to the global service, including checking the permission.
         GLOBAL_SERVICE.getAssignableDevices()
     }
 
     /// Get a list of supported OSes.
     fn getSupportedOSList(&self) -> binder::Result<Vec<String>> {
+        eprintln!("virtmgr: getSupportedOSList");
         Ok(Vec::from_iter(SUPPORTED_OS_NAMES.iter().cloned()))
     }
 
@@ -446,6 +524,10 @@ impl VirtualizationService {
         let vm_server = RpcServer::new_vsock(service, cid, port)
             .context(format!("Could not start RpcServer on port {port}"))
             .or_service_specific_exception(-1)?;
+        vm_server.set_supported_file_descriptor_transport_modes(&[
+            FileDescriptorTransportMode::None,
+            FileDescriptorTransportMode::Unix,
+        ]);
         vm_server.start();
         Ok((VmContext::new(Strong::new(Box::new(context)), vm_server), cid, temp_dir))
     }
@@ -466,6 +548,10 @@ impl VirtualizationService {
             let port = cid;
             match RpcServer::new_vsock(service, cid, port) {
                 Ok(vm_server) => {
+                    vm_server.set_supported_file_descriptor_transport_modes(&[
+                        FileDescriptorTransportMode::None,
+                        FileDescriptorTransportMode::Unix,
+                    ]);
                     vm_server.start();
                     return Ok((VmContext::new(vm_context, vm_server), cid, temp_dir));
                 }
@@ -488,6 +574,14 @@ impl VirtualizationService {
     ) -> binder::Result<Strong<dyn IVirtualMachine>> {
         let requester_uid = get_calling_uid();
         let requester_debug_pid = get_calling_pid();
+        debug_trace(format!(
+            "virtmgr: create_vm_internal enter requester_uid={} requester_debug_pid={}",
+            requester_uid, requester_debug_pid
+        ));
+        println!(
+            "virtmgr: create_vm_internal enter requester_uid={} requester_debug_pid={}",
+            requester_uid, requester_debug_pid
+        );
 
         check_config_features(config)?;
 
@@ -501,6 +595,16 @@ impl VirtualizationService {
         } else {
             self.create_vm_context(requester_debug_pid)?
         };
+        debug_trace(format!(
+            "virtmgr: create_vm_internal vm_context cid={} temp_dir={}",
+            cid,
+            temporary_directory.display()
+        ));
+        println!(
+            "virtmgr: create_vm_internal vm_context cid={} temp_dir={}",
+            cid,
+            temporary_directory.display()
+        );
 
         if is_custom_config(config) {
             check_use_custom_virtual_machine()?;
@@ -745,6 +849,8 @@ impl VirtualizationService {
             no_balloon: config.noBalloon,
             usb_config,
         };
+        debug_trace(format!("virtmgr: create_vm_internal before VmInstance::new cid={cid}"));
+        println!("virtmgr: create_vm_internal before VmInstance::new cid={cid}");
         let instance = Arc::new(
             VmInstance::new(
                 crosvm_config,
@@ -757,8 +863,16 @@ impl VirtualizationService {
             .with_log()
             .or_service_specific_exception(-1)?,
         );
-        state.add_vm(Arc::downgrade(&instance));
-        Ok(VirtualMachine::create(instance))
+        debug_trace(format!("virtmgr: create_vm_internal after VmInstance::new cid={cid}"));
+        println!("virtmgr: create_vm_internal after VmInstance::new cid={cid}");
+        let binder = VirtualMachine::create(instance.clone());
+        debug_trace(format!("virtmgr: create_vm_internal before state.add_vm cid={cid}"));
+        println!("virtmgr: create_vm_internal before state.add_vm cid={cid}");
+        state.add_vm(instance, binder.clone());
+        debug_trace(format!("virtmgr: create_vm_internal after state.add_vm cid={cid}"));
+        println!("virtmgr: create_vm_internal after state.add_vm cid={cid}");
+        eprintln!("virtmgr: retained vm binder");
+        Ok(binder)
     }
 }
 
@@ -822,61 +936,91 @@ fn maybe_create_device_tree_overlay(
     config: &VirtualMachineConfig,
     temporary_directory: &Path,
 ) -> binder::Result<Option<File>> {
-    // Currently, VirtMgr adds the host copy of reference DT & untrusted properties
-    // (e.g. instance-id)
-    let host_ref_dt = Path::new(VM_REFERENCE_DT_ON_HOST_PATH);
-    let host_ref_dt = if host_ref_dt.exists()
-        && read_dir(host_ref_dt).or_service_specific_exception(-1)?.next().is_some()
+    #[cfg(windows)]
     {
-        Some(host_ref_dt)
-    } else {
-        warn!("VM reference DT doesn't exist in host DT");
-        None
-    };
-
-    let vendor_hashtree_digest = extract_vendor_hashtree_digest(config)
-        .context("Failed to extract vendor hashtree digest")
-        .or_service_specific_exception(-1)?;
-
-    let trusted_props = if let Some(ref vendor_hashtree_digest) = vendor_hashtree_digest {
-        info!(
-            "Passing vendor hashtree digest to pvmfw. This will be rejected if it doesn't \
-                match the trusted digest in the pvmfw config, causing the VM to fail to start."
-        );
-        vec![(cstr!("vendor_hashtree_descriptor_root_digest"), vendor_hashtree_digest.as_slice())]
-    } else {
-        vec![]
-    };
-
-    let instance_id;
-    let mut untrusted_props = Vec::with_capacity(2);
-    if cfg!(llpvm_changes) {
-        instance_id = extract_instance_id(config);
-        untrusted_props.push((cstr!("instance-id"), &instance_id[..]));
-        let want_updatable = extract_want_updatable(config);
-        if want_updatable && is_secretkeeper_supported() {
-            // Let guest know that it can defer rollback protection to Secretkeeper by setting
-            // an empty property in untrusted node in DT. This enables Updatable VMs.
-            untrusted_props.push((cstr!("defer-rollback-protection"), &[]))
+        let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if let Ok(overlay_json_path) = std::env::var("VIRTMGR_DT_OVERLAY_JSON") {
+            let content = fs::read(&overlay_json_path)
+                .with_context(|| format!("Failed to read {overlay_json_path}"))
+                .or_service_specific_exception(-1)?;
+            let dt_output = temporary_directory.join(VM_DT_OVERLAY_PATH);
+            fs::write(&dt_output, content).or_service_specific_exception(-1)?;
+            return Ok(Some(File::open(dt_output).or_service_specific_exception(-1)?));
         }
+        if strict_parity {
+            let _ = config;
+            return Err(anyhow!(
+                "VIRTMGR_STRICT_PARITY=1: DT overlay unsupported on Windows without VIRTMGR_DT_OVERLAY_JSON"
+            ))
+            .or_binder_exception(ExceptionCode::UNSUPPORTED_OPERATION);
+        }
+        return Ok(None);
     }
-
-    let device_tree_overlay = if host_ref_dt.is_some()
-        || !untrusted_props.is_empty()
-        || !trusted_props.is_empty()
+    #[cfg(unix)]
     {
-        let dt_output = temporary_directory.join(VM_DT_OVERLAY_PATH);
-        let mut data = [0_u8; VM_DT_OVERLAY_MAX_SIZE];
-        let fdt =
-            create_device_tree_overlay(&mut data, host_ref_dt, &untrusted_props, &trusted_props)
+        // Currently, VirtMgr adds the host copy of reference DT & untrusted properties
+        // (e.g. instance-id)
+        let host_ref_dt = Path::new(VM_REFERENCE_DT_ON_HOST_PATH);
+        let host_ref_dt = if host_ref_dt.exists()
+            && read_dir(host_ref_dt).or_service_specific_exception(-1)?.next().is_some()
+        {
+            Some(host_ref_dt)
+        } else {
+            warn!("VM reference DT doesn't exist in host DT");
+            None
+        };
+
+        let vendor_hashtree_digest = extract_vendor_hashtree_digest(config)
+            .context("Failed to extract vendor hashtree digest")
+            .or_service_specific_exception(-1)?;
+
+        let trusted_props = if let Some(ref vendor_hashtree_digest) = vendor_hashtree_digest {
+            info!(
+                "Passing vendor hashtree digest to pvmfw. This will be rejected if it doesn't \
+                match the trusted digest in the pvmfw config, causing the VM to fail to start."
+            );
+            vec![(
+                cstr!("vendor_hashtree_descriptor_root_digest"),
+                vendor_hashtree_digest.as_slice(),
+            )]
+        } else {
+            vec![]
+        };
+
+        let instance_id;
+        let mut untrusted_props = Vec::with_capacity(2);
+        if cfg!(llpvm_changes) {
+            instance_id = extract_instance_id(config);
+            untrusted_props.push((cstr!("instance-id"), &instance_id[..]));
+            let want_updatable = extract_want_updatable(config);
+            if want_updatable && is_secretkeeper_supported() {
+                // Let guest know that it can defer rollback protection to Secretkeeper by setting
+                // an empty property in untrusted node in DT. This enables Updatable VMs.
+                untrusted_props.push((cstr!("defer-rollback-protection"), &[]))
+            }
+        }
+
+        let device_tree_overlay =
+            if host_ref_dt.is_some() || !untrusted_props.is_empty() || !trusted_props.is_empty() {
+                let dt_output = temporary_directory.join(VM_DT_OVERLAY_PATH);
+                let mut data = [0_u8; VM_DT_OVERLAY_MAX_SIZE];
+                let fdt = create_device_tree_overlay(
+                    &mut data,
+                    host_ref_dt,
+                    &untrusted_props,
+                    &trusted_props,
+                )
                 .map_err(|e| anyhow!("Failed to create DT overlay, {e:?}"))
                 .or_service_specific_exception(-1)?;
-        fs::write(&dt_output, fdt.as_slice()).or_service_specific_exception(-1)?;
-        Some(File::open(dt_output).or_service_specific_exception(-1)?)
-    } else {
-        None
-    };
-    Ok(device_tree_overlay)
+                fs::write(&dt_output, fdt.as_slice()).or_service_specific_exception(-1)?;
+                Some(File::open(dt_output).or_service_specific_exception(-1)?)
+            } else {
+                None
+            };
+        Ok(device_tree_overlay)
+    }
 }
 
 fn write_zero_filler(zero_filler_path: &Path) -> Result<()> {
@@ -1012,7 +1156,10 @@ fn extract_os_name_from_config_path(config: &Path) -> Option<String> {
 }
 
 fn extract_os_names_from_configs(config_glob_pattern: &str) -> Result<HashSet<String>> {
-    let configs = glob(config_glob_pattern)?.collect::<Result<Vec<_>, _>>()?;
+    #[cfg(windows)]
+    let config_glob_pattern =
+        resolve_host_path(Path::new(config_glob_pattern)).to_string_lossy().into_owned();
+    let configs = glob(&config_glob_pattern)?.collect::<Result<Vec<_>, _>>()?;
     let os_names =
         configs.iter().filter_map(|x| extract_os_name_from_config_path(x)).collect::<HashSet<_>>();
 
@@ -1093,9 +1240,61 @@ fn load_app_config(
 
     // It is safe to construct a filename based on the os_name because we've already checked that it
     // is one of the allowed values.
-    let vm_config_path = PathBuf::from(format!("/apex/com.android.virt/etc/{}.json", os_name));
+    let vm_config_path = {
+        #[cfg(windows)]
+        {
+            if let Ok(custom_json) = std::env::var("VIRTMGR_MICRODROID_JSON") {
+                PathBuf::from(custom_json)
+            } else {
+                let apex_json = resolve_host_path(Path::new(&format!(
+                    "/apex/com.android.virt/etc/{os_name}.json"
+                )));
+                if apex_json.exists() {
+                    apex_json
+                } else {
+                    PathBuf::from(format!(
+                        "C:/workspace/aosp/packages/modules/Virtualization/build/microdroid/{os_name}.json"
+                    ))
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from(format!("/apex/com.android.virt/etc/{}.json", os_name))
+        }
+    };
     let vm_config_file = File::open(vm_config_path)?;
     let mut vm_config = VmConfig::load(&vm_config_file)?.to_parcelable()?;
+    #[cfg(windows)]
+    {
+        let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if config.protectedVm {
+            if strict_parity {
+                bail!(
+                    "VIRTMGR_STRICT_PARITY=1: protectedVm is not Android-equivalent on Windows host"
+                );
+            }
+            warn!("Windows host mode: protectedVm is accepted but not Android-equivalent in isolation semantics");
+        }
+        if config.hugePages {
+            if strict_parity {
+                bail!(
+                    "VIRTMGR_STRICT_PARITY=1: hugePages parity is not guaranteed on Windows host"
+                );
+            }
+            warn!("Windows host mode: hugePages is accepted but backend behavior may differ");
+        }
+        if config.boostUclamp {
+            if strict_parity {
+                bail!(
+                    "VIRTMGR_STRICT_PARITY=1: boostUclamp parity is not guaranteed on Windows host"
+                );
+            }
+            warn!("Windows host mode: boostUclamp is accepted but scheduler behavior may differ");
+        }
+    }
 
     if let Some(custom_config) = &config.customConfig {
         if let Some(file) = custom_config.customKernelImage.as_ref() {
@@ -1112,6 +1311,30 @@ fn load_app_config(
 
         vm_config.devices.clone_from(&custom_config.devices);
         vm_config.networkSupported = custom_config.networkSupported;
+        #[cfg(windows)]
+        {
+            let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !custom_config.devices.is_empty() {
+                if strict_parity {
+                    bail!(
+                        "VIRTMGR_STRICT_PARITY=1: customConfig.devices is not Android-equivalent on Windows host"
+                    );
+                }
+                warn!(
+                    "Windows host mode: customConfig.devices is accepted but device-assignment semantics may differ"
+                );
+            }
+            if custom_config.networkSupported {
+                if strict_parity {
+                    bail!(
+                        "VIRTMGR_STRICT_PARITY=1: networkSupported parity is not guaranteed on Windows host"
+                    );
+                }
+                warn!("Windows host mode: networkSupported is accepted but backend may differ");
+            }
+        }
 
         for param in custom_config.extraKernelCmdlineParams.iter() {
             append_kernel_param(param, &mut vm_config);
@@ -1147,19 +1370,26 @@ fn load_app_config(
 }
 
 fn check_partition_for_file(fd: &ParcelFileDescriptor) -> Result<()> {
-    let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-    let link = fs::read_link(&path).context(format!("can't read_link {path}"))?;
-
-    // microdroid vendor image is OK
-    if cfg!(vendor_modules) && link == Path::new("/vendor/etc/avf/microdroid/microdroid_vendor.img")
+    #[cfg(unix)]
     {
-        return Ok(());
-    }
+        let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        let link = fs::read_link(&path).context(format!("can't read_link {path}"))?;
 
-    if link.starts_with("/vendor") || link.starts_with("/odm") {
-        bail!("vendor or odm file {} can't be used for VM", link.display());
-    }
+        // microdroid vendor image is OK
+        if cfg!(vendor_modules)
+            && link == Path::new("/vendor/etc/avf/microdroid/microdroid_vendor.img")
+        {
+            return Ok(());
+        }
 
+        if link.starts_with("/vendor") || link.starts_with("/odm") {
+            bail!("vendor or odm file {} can't be used for VM", link.display());
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = fd;
+    }
     Ok(())
 }
 
@@ -1233,23 +1463,56 @@ struct CompositeImageFilenames {
 
 /// Checks whether the caller has a specific permission
 fn check_permission(perm: &str) -> binder::Result<()> {
-    if cfg!(early) {
-        // Skip permission check for early VMs, in favor of SELinux
+    #[cfg(windows)]
+    {
+        if let Some(allowlist) = parse_allowlist_from_env_or_file(
+            "VIRTMGR_MOCK_PERMISSION_ALLOWLIST",
+            "VIRTMGR_MOCK_PERMISSION_ALLOWLIST_FILE",
+        )
+        .or_service_specific_exception(-1)?
+        {
+            if allowlist.contains(perm) {
+                return Ok(());
+            }
+            return Err(anyhow!("mock permission provider denied: {perm}"))
+                .or_binder_exception(ExceptionCode::SECURITY);
+        }
+        let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if strict_parity {
+            return Err(anyhow!(
+                "VIRTMGR_STRICT_PARITY=1: permission checks require Android permission service"
+            ))
+            .or_binder_exception(ExceptionCode::UNSUPPORTED_OPERATION);
+        }
+        static WARN_ONCE: Once = Once::new();
+        WARN_ONCE.call_once(|| {
+            warn!("Windows host mode: permission checks are bypassed (permission service unavailable)");
+        });
+        let _ = perm;
         return Ok(());
     }
-    let calling_pid = get_calling_pid();
-    let calling_uid = get_calling_uid();
-    // Root can do anything
-    if calling_uid == 0 {
-        return Ok(());
-    }
-    let perm_svc: Strong<dyn IPermissionController::IPermissionController> =
-        binder::wait_for_interface("permission")?;
-    if perm_svc.checkPermission(perm, calling_pid, calling_uid as i32)? {
-        Ok(())
-    } else {
-        Err(anyhow!("does not have the {} permission", perm))
-            .or_binder_exception(ExceptionCode::SECURITY)
+    #[cfg(unix)]
+    {
+        if cfg!(early) {
+            // Skip permission check for early VMs, in favor of SELinux
+            return Ok(());
+        }
+        let calling_pid = get_calling_pid();
+        let calling_uid = get_calling_uid();
+        // Root can do anything
+        if calling_uid == 0 {
+            return Ok(());
+        }
+        let perm_svc: Strong<dyn IPermissionController::IPermissionController> =
+            binder::wait_for_interface("permission")?;
+        if perm_svc.checkPermission(perm, calling_pid, calling_uid as i32)? {
+            Ok(())
+        } else {
+            Err(anyhow!("does not have the {} permission", perm))
+                .or_binder_exception(ExceptionCode::SECURITY)
+        }
     }
 }
 
@@ -1279,6 +1542,34 @@ fn is_safe_raw_partition(label: &str) -> bool {
     label == "vm-instance"
 }
 
+#[cfg(windows)]
+fn parse_allowlist_from_env_or_file(
+    env_csv_key: &str,
+    env_file_key: &str,
+) -> Result<Option<HashSet<String>>> {
+    if let Ok(csv) = std::env::var(env_csv_key) {
+        let parsed: HashSet<String> = csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        return Ok(Some(parsed));
+    }
+    if let Ok(path) = std::env::var(env_file_key) {
+        let content =
+            std::fs::read_to_string(&path).with_context(|| format!("Failed to read {path}"))?;
+        let parsed: HashSet<String> = content
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('#'))
+            .map(ToOwned::to_owned)
+            .collect();
+        return Ok(Some(parsed));
+    }
+    Ok(None)
+}
+
 /// Check that a file SELinux label is acceptable.
 ///
 /// We only want to allow code in a VM to be sourced from places that apps, and the
@@ -1303,9 +1594,36 @@ fn check_label_is_allowed(context: &SeContext) -> Result<()> {
 }
 
 fn check_label_for_partition(partition: &Partition) -> Result<()> {
-    let file = partition.image.as_ref().unwrap().as_ref();
-    check_label_is_allowed(&getfilecon(file)?)
-        .with_context(|| format!("Partition {} invalid", &partition.label))
+    #[cfg(windows)]
+    {
+        if let Some(allowlist) = parse_allowlist_from_env_or_file(
+            "VIRTMGR_MOCK_SELINUX_LABEL_ALLOWLIST",
+            "VIRTMGR_MOCK_SELINUX_LABEL_ALLOWLIST_FILE",
+        )? {
+            if allowlist.contains(&partition.label) {
+                return Ok(());
+            }
+            bail!("mock SELinux provider denied partition label {}", partition.label);
+        }
+        let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if strict_parity {
+            bail!("VIRTMGR_STRICT_PARITY=1: SELinux label checks require Android SELinux runtime");
+        }
+        static WARN_ONCE: Once = Once::new();
+        WARN_ONCE.call_once(|| {
+            warn!("Windows host mode: SELinux label checks are bypassed");
+        });
+        let _ = partition;
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        let file = partition.image.as_ref().unwrap().as_ref();
+        check_label_is_allowed(&getfilecon(file)?)
+            .with_context(|| format!("Partition {} invalid", &partition.label))
+    }
 }
 
 fn check_label_for_kernel_files(kernel: &Option<File>, initrd: &Option<File>) -> Result<()> {
@@ -1318,7 +1636,34 @@ fn check_label_for_kernel_files(kernel: &Option<File>, initrd: &Option<File>) ->
     Ok(())
 }
 fn check_label_for_file(file: &File, name: &str) -> Result<()> {
-    check_label_is_allowed(&getfilecon(file)?).with_context(|| format!("{} file invalid", name))
+    #[cfg(windows)]
+    {
+        if let Some(allowlist) = parse_allowlist_from_env_or_file(
+            "VIRTMGR_MOCK_SELINUX_LABEL_ALLOWLIST",
+            "VIRTMGR_MOCK_SELINUX_LABEL_ALLOWLIST_FILE",
+        )? {
+            if allowlist.contains(name) {
+                return Ok(());
+            }
+            bail!("mock SELinux provider denied file label {}", name);
+        }
+        let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if strict_parity {
+            bail!("VIRTMGR_STRICT_PARITY=1: SELinux label checks require Android SELinux runtime");
+        }
+        static WARN_ONCE: Once = Once::new();
+        WARN_ONCE.call_once(|| {
+            warn!("Windows host mode: SELinux label checks are bypassed");
+        });
+        let _ = (file, name);
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        check_label_is_allowed(&getfilecon(file)?).with_context(|| format!("{} file invalid", name))
+    }
 }
 
 /// Implementation of the AIDL `IVirtualMachine` interface. Used as a handle to a VM.
@@ -1403,13 +1748,69 @@ impl IVirtualMachine for VirtualMachine {
             return Err(anyhow!("Can't connect to privileged port {port}"))
                 .or_service_specific_exception(-1);
         }
-        let stream = VsockStream::connect_with_cid_port(self.instance.cid, port)
-            .context("Failed to connect")
-            .or_service_specific_exception(-1)?;
-        Ok(vsock_stream_to_pfd(stream))
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        {
+            let stream = crate::vsock_transport::connect(self.instance.cid as u32, port)
+                .context("Failed to connect vsock transport")
+                .or_service_specific_exception(-1)?;
+            Ok(crate::vsock_transport::into_parcel_file_descriptor(stream))
+        }
+        #[cfg(all(
+            unix,
+            not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+        ))]
+        {
+            Err(anyhow!(
+                "connectVsock is not supported on this host (requires Linux/Android vsock, macOS UDS, or Windows)"
+            ))
+            .or_service_specific_exception(-1)
+        }
+        #[cfg(windows)]
+        {
+            self.instance
+                .prepare_vsock_connection(port)
+                .context("Failed to ask crosvm to prepare Windows host-initiated vsock connection")
+                .or_service_specific_exception(-1)?;
+            let handle = crate::vsock_transport::connect(self.instance.cid, port)
+                .context("Failed to connect named pipe (Windows vsock mapping)")
+                .or_service_specific_exception(-1)?;
+            Ok(crate::vsock_transport::into_parcel_file_descriptor(handle))
+        }
+    }
+
+    fn startHostVsockTcpBridge(&self, hostPort: i32, guestPort: i32) -> binder::Result<()> {
+        if !matches!(&*self.instance.vm_state.lock().unwrap(), VmState::Running { .. }) {
+            return Err(anyhow!("VM is not running")).or_service_specific_exception(-1);
+        }
+        if hostPort <= 0 || hostPort > u16::MAX as i32 {
+            return Err(anyhow!("Invalid host TCP port {hostPort}")).or_service_specific_exception(-1);
+        }
+        if guestPort < 1024 {
+            return Err(anyhow!("Invalid guest vsock port {guestPort}"))
+                .or_service_specific_exception(-1);
+        }
+
+        #[cfg(windows)]
+        {
+            self.instance
+                .start_host_vsock_tcp_bridge(hostPort as u16, guestPort as u32)
+                .with_context(|| {
+                    format!(
+                        "Error starting Windows host TCP bridge on 127.0.0.1:{hostPort} -> guest vsock:{guestPort}"
+                    )
+                })
+                .with_log()
+                .or_service_specific_exception(-1)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(anyhow!("startHostVsockTcpBridge is only supported on Windows hosts"))
+                .or_service_specific_exception(-1)
+        }
     }
 
     fn setHostConsoleName(&self, ptsname: &str) -> binder::Result<()> {
+        self.instance.remember_host_console_name(ptsname);
         self.instance.vm_context.global_context.setHostConsoleName(ptsname)
     }
 
@@ -1432,7 +1833,16 @@ impl IVirtualMachine for VirtualMachine {
 
 impl Drop for VirtualMachine {
     fn drop(&mut self) {
+        eprintln!("virtmgr: dropping VirtualMachine cid={}", self.instance.cid);
         debug!("Dropping {:?}", self);
+        #[cfg(windows)]
+        if std::env::var_os("VIRTMGR_SERVICE_DIR").is_some() {
+            debug!(
+                "Persistent Windows virtmgr mode active; keeping VM with CID {} alive after binder drop",
+                self.instance.cid
+            );
+            return;
+        }
         if let Err(e) = self.instance.kill() {
             debug!("Error stopping dropped VM with CID {}: {:?}", self.instance.cid, e);
         }
@@ -1447,6 +1857,7 @@ pub struct VirtualMachineCallbacks(Mutex<Vec<Strong<dyn IVirtualMachineCallback>
 impl VirtualMachineCallbacks {
     /// Call all registered callbacks to notify that the payload has started.
     pub fn notify_payload_started(&self, cid: Cid) {
+        debug_trace(format!("virtmgr: notify_payload_started cid={cid}"));
         let callbacks = &*self.0.lock().unwrap();
         for callback in callbacks {
             if let Err(e) = callback.onPayloadStarted(cid as i32) {
@@ -1457,6 +1868,7 @@ impl VirtualMachineCallbacks {
 
     /// Call all registered callbacks to notify that the payload is ready to serve.
     pub fn notify_payload_ready(&self, cid: Cid) {
+        debug_trace(format!("virtmgr: notify_payload_ready cid={cid}"));
         let callbacks = &*self.0.lock().unwrap();
         for callback in callbacks {
             if let Err(e) = callback.onPayloadReady(cid as i32) {
@@ -1477,6 +1889,10 @@ impl VirtualMachineCallbacks {
 
     /// Call all registered callbacks to say that the VM encountered an error.
     pub fn notify_error(&self, cid: Cid, error_code: ErrorCode, message: &str) {
+        debug_trace(format!(
+            "virtmgr: notify_error cid={cid} error_code={:?} message={message}",
+            error_code
+        ));
         let callbacks = &*self.0.lock().unwrap();
         for callback in callbacks {
             if let Err(e) = callback.onError(cid as i32, error_code, message) {
@@ -1487,10 +1903,24 @@ impl VirtualMachineCallbacks {
 
     /// Call all registered callbacks to say that the VM has died.
     pub fn callback_on_died(&self, cid: Cid, reason: DeathReason) {
+        debug_trace(format!("virtmgr: callback_on_died cid={cid} reason={:?}", reason));
         let callbacks = &*self.0.lock().unwrap();
-        for callback in callbacks {
+        for (index, callback) in callbacks.iter().enumerate() {
+            debug_trace(format!(
+                "virtmgr: callback_on_died before callback index={} cid={} reason={:?}",
+                index, cid, reason
+            ));
             if let Err(e) = callback.onDied(cid as i32, reason) {
+                debug_trace(format!(
+                    "virtmgr: callback_on_died error callback index={} cid={} error={:?}",
+                    index, cid, e
+                ));
                 error!("Error notifying exit of VM CID {}: {:?}", cid, e);
+            } else {
+                debug_trace(format!(
+                    "virtmgr: callback_on_died after callback index={} cid={} reason={:?}",
+                    index, cid, reason
+                ));
             }
         }
     }
@@ -1509,28 +1939,27 @@ struct State {
     /// list while a strong reference is returned to the caller over Binder. Once all copies of
     /// the Binder client are dropped the weak reference here will become invalid, and will be
     /// removed from the list opportunistically the next time `add_vm` is called.
-    vms: Vec<Weak<VmInstance>>,
+    vms: Vec<(Arc<VmInstance>, Strong<dyn IVirtualMachine>)>,
 }
 
 impl State {
     /// Get a list of VMs which still have Binder references to them.
     fn vms(&self) -> Vec<Arc<VmInstance>> {
-        // Attempt to upgrade the weak pointers to strong pointers.
-        self.vms.iter().filter_map(Weak::upgrade).collect()
+        self.vms.iter().map(|(vm, _)| vm.clone()).collect()
     }
 
     /// Add a new VM to the list.
-    fn add_vm(&mut self, vm: Weak<VmInstance>) {
-        // Garbage collect any entries from the stored list which no longer exist.
-        self.vms.retain(|vm| vm.strong_count() > 0);
-
-        // Actually add the new VM.
-        self.vms.push(vm);
+    fn add_vm(&mut self, vm: Arc<VmInstance>, binder: Strong<dyn IVirtualMachine>) {
+        self.vms
+            .retain(|(vm, _)| !matches!(&*vm.vm_state.lock().unwrap(), VmState::Dead | VmState::Failed));
+        self.vms.push((vm, binder));
     }
 
     /// Get a VM that corresponds to the given cid
     fn get_vm(&self, cid: Cid) -> Option<Arc<VmInstance>> {
-        self.vms().into_iter().find(|vm| vm.cid == cid)
+        self.vms
+            .iter()
+            .find_map(|(vm, _)| if vm.cid == cid { Some(vm.clone()) } else { None })
     }
 }
 
@@ -1552,23 +1981,20 @@ fn get_state(instance: &VmInstance) -> VirtualMachineState {
 
 /// Converts a `&ParcelFileDescriptor` to a `File` by cloning the file.
 pub fn clone_file(file: &ParcelFileDescriptor) -> binder::Result<File> {
+    println!("virtmgr: clone_file enter");
     file.as_ref()
         .try_clone()
         .context("Failed to clone File from ParcelFileDescriptor")
         .or_binder_exception(ExceptionCode::BAD_PARCELABLE)
-        .map(File::from)
+        .map(|f| {
+            println!("virtmgr: clone_file after try_clone");
+            File::from(f)
+        })
 }
 
 /// Converts an `&Option<ParcelFileDescriptor>` to an `Option<File>` by cloning the file.
 fn maybe_clone_file(file: &Option<ParcelFileDescriptor>) -> binder::Result<Option<File>> {
     file.as_ref().map(clone_file).transpose()
-}
-
-/// Converts a `VsockStream` to a `ParcelFileDescriptor`.
-fn vsock_stream_to_pfd(stream: VsockStream) -> ParcelFileDescriptor {
-    // SAFETY: ownership is transferred from stream to f
-    let f = unsafe { File::from_raw_fd(stream.into_raw_fd()) };
-    ParcelFileDescriptor::new(f)
 }
 
 /// Parses the platform version requirement string.
@@ -1723,12 +2149,25 @@ fn clone_or_prepare_logger_fd(
         return Ok(Some(clone_file(fd)?));
     }
 
-    let (read_fd, write_fd) =
-        pipe().context("Failed to create pipe").or_service_specific_exception(-1)?;
+    #[cfg(windows)]
+    {
+        let _ = tag;
+        return Err(Status::new_exception_str(
+            ExceptionCode::UNSUPPORTED_OPERATION,
+            Some("console pipe without inherited fd is not supported on Windows"),
+        ));
+    }
 
+    #[cfg(unix)]
+    let (read_fd, write_fd) =
+        { pipe().context("Failed to create pipe").or_service_specific_exception(-1)? };
+
+    #[cfg(unix)]
     let mut reader = BufReader::new(File::from(read_fd));
+    #[cfg(unix)]
     let write_fd = File::from(write_fd);
 
+    #[cfg(unix)]
     std::thread::spawn(move || loop {
         let mut buf = vec![];
         match reader.read_until(b'\n', &mut buf) {
@@ -1749,7 +2188,10 @@ fn clone_or_prepare_logger_fd(
         };
     });
 
-    Ok(Some(write_fd))
+    #[cfg(unix)]
+    {
+        Ok(Some(write_fd))
+    }
 }
 
 /// Simple utility for referencing Borrowed or Owned. Similar to std::borrow::Cow, but
@@ -1780,6 +2222,7 @@ impl Interface for VirtualMachineService {}
 impl IVirtualMachineService for VirtualMachineService {
     fn notifyPayloadStarted(&self) -> binder::Result<()> {
         let cid = self.cid;
+        debug_trace(format!("virtmgr: notifyPayloadStarted cid={cid}"));
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
             info!("VM with CID {} started payload", cid);
             vm.update_payload_state(PayloadState::Started)
@@ -1797,6 +2240,7 @@ impl IVirtualMachineService for VirtualMachineService {
 
     fn notifyPayloadReady(&self) -> binder::Result<()> {
         let cid = self.cid;
+        debug_trace(format!("virtmgr: notifyPayloadReady cid={cid}"));
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
             info!("VM with CID {} reported payload is ready", cid);
             vm.update_payload_state(PayloadState::Ready)
@@ -1811,6 +2255,7 @@ impl IVirtualMachineService for VirtualMachineService {
 
     fn notifyPayloadFinished(&self, exit_code: i32) -> binder::Result<()> {
         let cid = self.cid;
+        debug_trace(format!("virtmgr: notifyPayloadFinished cid={cid} exit_code={exit_code}"));
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
             info!("VM with CID {} finished payload", cid);
             vm.update_payload_state(PayloadState::Finished)
@@ -1825,6 +2270,10 @@ impl IVirtualMachineService for VirtualMachineService {
 
     fn notifyError(&self, error_code: ErrorCode, message: &str) -> binder::Result<()> {
         let cid = self.cid;
+        debug_trace(format!(
+            "virtmgr: notifyError cid={cid} code={:?} message={}",
+            error_code, message
+        ));
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
             info!("VM with CID {} encountered an error", cid);
             vm.update_payload_state(PayloadState::Finished)

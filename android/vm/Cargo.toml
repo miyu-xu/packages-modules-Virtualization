@@ -1,0 +1,47 @@
+[package]
+name = "vm"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Android VM control tool (host / cargo dev builds)"
+publish = false
+
+[[bin]]
+name = "vm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+binder = { path = "../../../../../frameworks/native/libs/binder/rust" }
+clap = { version = "4.0", features = ["derive"] }
+cfg-if = "1.0"
+env_logger = "0.10"
+glob = "0.3"
+hypervisor_props = { path = "../../libs/hypervisor_props" }
+libc = "0.2"
+log = "0.4"
+microdroid_payload_config = { path = "../../libs/microdroid_payload_config" }
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+vmclient = { path = "../../libs/libvmclient" }
+vmconfig = { path = "../../libs/vmconfig" }
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+android_system_virtualizationservice = { path = "../virtualizationservice/aidl/android/system/virtualizationservice" }
+avf_features = { path = "../../libs/avf_features" }
+
+# Soong sets these via `avf_build_flags_rust`; for `cargo check` they are normally unset.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(device_assignment)',
+    'cfg(dice_changes)',
+    'cfg(debuggable_vms_improvements)',
+    'cfg(llpvm_changes)',
+    'cfg(multi_tenant)',
+    'cfg(network)',
+    'cfg(paravirtualized_devices)',
+    'cfg(remote_attestation)',
+    'cfg(tpu_assignable_device)',
+    'cfg(vendor_modules)',
+    'cfg(virt_cpufreq)',
+] }

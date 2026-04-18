@@ -36,15 +36,27 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::time::Duration;
 use vmclient::{ErrorCode, VmInstance};
-use vmconfig::{get_debug_level, open_parcel_file, VmConfig};
+use vmconfig::{get_debug_level, open_parcel_file, resolve_host_path, VmConfig};
 use zip::ZipArchive;
+
+#[cfg(windows)]
+const WINDOWS_FILE_CONSOLE_PREFIX: &str = "win-file-console|";
+
+#[cfg(windows)]
+fn persistent_service_mode_enabled() -> bool {
+    std::env::var_os("VIRTMGR_SERVICE_DIR").is_some()
+}
 
 /// Run a VM from the given APK, idsig, and config.
 pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
     let service = get_service()?;
+    println!("vm: got virtualization service");
     let apk = File::open(&config.apk).context("Failed to open APK file")?;
 
     let extra_apks = match config.config_path.as_deref() {
@@ -63,26 +75,32 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
     for (i, extra_apk) in extra_apks.iter().enumerate() {
         let extra_apk_fd = ParcelFileDescriptor::new(File::open(extra_apk)?);
         let extra_idsig_fd = ParcelFileDescriptor::new(File::create(&config.extra_idsigs[i])?);
-        service.createOrUpdateIdsigFile(&extra_apk_fd, &extra_idsig_fd)?;
+        println!("vm: before service.createOrUpdateIdsigFile extra index={i}");
+        service.as_ref().createOrUpdateIdsigFile(&extra_apk_fd, &extra_idsig_fd)?;
+        println!("vm: after service.createOrUpdateIdsigFile extra index={i}");
     }
 
     let idsig = File::create(&config.idsig).context("Failed to create idsig file")?;
 
     let apk_fd = ParcelFileDescriptor::new(apk);
     let idsig_fd = ParcelFileDescriptor::new(idsig);
-    service.createOrUpdateIdsigFile(&apk_fd, &idsig_fd)?;
+    println!("vm: before service.createOrUpdateIdsigFile main");
+    service.as_ref().createOrUpdateIdsigFile(&apk_fd, &idsig_fd)?;
+    println!("vm: after service.createOrUpdateIdsigFile main");
 
     let idsig = File::open(&config.idsig).context("Failed to open idsig file")?;
     let idsig_fd = ParcelFileDescriptor::new(idsig);
 
     if !config.instance.exists() {
         const INSTANCE_FILE_SIZE: u64 = 10 * 1024 * 1024;
+        println!("vm: before command_create_partition instance");
         command_create_partition(
             service.as_ref(),
             &config.instance,
             INSTANCE_FILE_SIZE,
             PartitionType::ANDROID_VM_INSTANCE,
         )?;
+        println!("vm: after command_create_partition instance");
     }
 
     let instance_id = if cfg!(llpvm_changes) {
@@ -93,7 +111,9 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
             instance_id_file.read_exact(&mut id)?;
             id
         } else {
-            let id = service.allocateInstanceId().context("Failed to allocate instance_id")?;
+            println!("vm: before service.allocateInstanceId");
+            let id = service.as_ref().allocateInstanceId().context("Failed to allocate instance_id")?;
+            println!("vm: after service.allocateInstanceId");
             let mut instance_id_file = File::create(id_file)?;
             instance_id_file.write_all(&id)?;
             id
@@ -105,12 +125,14 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
 
     let storage = if let Some(ref path) = config.microdroid.storage {
         if !path.exists() {
+            println!("vm: before command_create_partition storage");
             command_create_partition(
                 service.as_ref(),
                 path,
                 config.microdroid.storage_size.unwrap_or(10 * 1024 * 1024),
                 PartitionType::ENCRYPTEDSTORE,
             )?;
+            println!("vm: after command_create_partition storage");
         }
         Some(open_parcel_file(path, true)?)
     } else {
@@ -203,19 +225,24 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
         config.debug.console.as_ref().map(|p| p.as_ref()),
         config.debug.console_in.as_ref().map(|p| p.as_ref()),
         config.debug.log.as_ref().map(|p| p.as_ref()),
+        config.debug.adb_tcp_port(),
     )
 }
 
 fn find_empty_payload_apk_path() -> Result<PathBuf, Error> {
     const GLOB_PATTERN: &str = "/apex/com.android.virt/app/**/EmptyPayloadApp*.apk";
+    #[cfg(windows)]
+    let pattern = resolve_host_path(Path::new(GLOB_PATTERN)).to_string_lossy().into_owned();
+    #[cfg(not(windows))]
+    let pattern = GLOB_PATTERN.to_owned();
     let mut entries: Vec<PathBuf> =
-        glob(GLOB_PATTERN).context("failed to glob")?.filter_map(|e| e.ok()).collect();
+        glob(&pattern).context("failed to glob")?.filter_map(|e| e.ok()).collect();
     if entries.len() > 1 {
-        return Err(anyhow!("Found more than one apk matching {}", GLOB_PATTERN));
+        return Err(anyhow!("Found more than one apk matching {}", pattern));
     }
     match entries.pop() {
         Some(path) => Ok(path),
-        None => Err(anyhow!("No apks match {}", GLOB_PATTERN)),
+        None => Err(anyhow!("No apks match {}", pattern)),
     }
 }
 
@@ -277,13 +304,15 @@ pub fn command_run(config: RunCustomVmConfig) -> Result<(), Error> {
     vm_config.cpuTopology = config.common.cpu_topology;
     vm_config.hugePages = config.common.hugepages;
     vm_config.boostUclamp = config.common.boost_uclamp;
+    let service = get_service()?;
     run(
-        get_service()?.as_ref(),
+        service.as_ref(),
         &VirtualMachineConfig::RawConfig(vm_config),
         &format!("{:?}", &config.config),
         config.debug.console.as_ref().map(|p| p.as_ref()),
         config.debug.console_in.as_ref().map(|p| p.as_ref()),
         config.debug.log.as_ref().map(|p| p.as_ref()),
+        config.debug.adb_tcp_port(),
     )
 }
 
@@ -306,13 +335,14 @@ fn run(
     console_out_path: Option<&Path>,
     console_in_path: Option<&Path>,
     log_path: Option<&Path>,
+    adb_tcp_port: Option<u16>,
 ) -> Result<(), Error> {
     let console_out = if let Some(console_out_path) = console_out_path {
         Some(File::create(console_out_path).with_context(|| {
             format!("Failed to open console output file {:?}", console_out_path)
         })?)
     } else {
-        Some(duplicate_fd(io::stdout())?)
+        Some(duplicate_stdio_out()?)
     };
     let console_in =
         if let Some(console_in_path) = console_in_path {
@@ -320,7 +350,7 @@ fn run(
                 format!("Failed to open console input file {:?}", console_in_path)
             })?)
         } else {
-            Some(duplicate_fd(io::stdin())?)
+            Some(duplicate_stdio_in()?)
         };
     let log = if let Some(log_path) = log_path {
         Some(
@@ -328,12 +358,23 @@ fn run(
                 .with_context(|| format!("Failed to open log file {:?}", log_path))?,
         )
     } else {
-        Some(duplicate_fd(io::stdout())?)
+        Some(duplicate_stdio_out()?)
     };
     let callback = Box::new(Callback {});
+    println!("vm: before VmInstance::create");
     let vm = VmInstance::create(service, config, console_out, console_in, log, Some(callback))
         .context("Failed to create VM")?;
+    println!("vm: after VmInstance::create");
+    #[cfg(windows)]
+    if let Some(console_out_path) = console_out_path {
+        let host_console_name =
+            encode_windows_host_console_name(console_out_path, console_in_path);
+        vm.set_host_console_name(&host_console_name)
+            .context("Failed to register host console metadata for vm console")?;
+    }
+    println!("vm: before vm.start");
     vm.start().context("Failed to start VM")?;
+    println!("vm: after vm.start");
 
     let debug_level = get_debug_level(config).unwrap_or(DebugLevel::NONE);
 
@@ -344,6 +385,25 @@ fn run(
         vm.cid(),
         state_to_str(vm.state()?)
     );
+
+    #[cfg(windows)]
+    {
+        let should_detach_after_ready = persistent_service_mode_enabled();
+        if should_detach_after_ready || adb_tcp_port.is_some() {
+            vm.wait_until_ready(Duration::from_secs(90)).context(
+                "VM did not reach READY state before starting the local ADB bridge or detaching",
+            )?;
+        }
+        if let Some(port) = adb_tcp_port {
+            vm.start_tcp_vsock_bridge(port, 5555)
+                .with_context(|| format!("Failed to start local ADB bridge on 127.0.0.1:{port}"))?;
+            println!("ADB bridge listening on 127.0.0.1:{port} -> guest vsock:5555");
+        }
+        if should_detach_after_ready {
+            println!("Persistent Windows virtmgr mode: leaving VM running after READY.");
+            return Ok(());
+        }
+    }
 
     // Wait until the VM or VirtualizationService dies. If we just returned immediately then the
     // IVirtualMachine Binder object would be dropped and the VM would be killed.
@@ -379,7 +439,43 @@ impl vmclient::VmCallback for Callback {
     }
 }
 
-/// Safely duplicate the file descriptor.
+#[cfg(unix)]
+fn duplicate_stdio_out() -> io::Result<File> {
+    duplicate_fd(io::stdout())
+}
+
+#[cfg(unix)]
+fn duplicate_stdio_in() -> io::Result<File> {
+    duplicate_fd(io::stdin())
+}
+
+#[cfg(windows)]
+fn duplicate_stdio_out() -> io::Result<File> {
+    File::open("CONOUT$")
+}
+
+#[cfg(windows)]
+fn duplicate_stdio_in() -> io::Result<File> {
+    File::open("CONIN$")
+}
+
+#[cfg(windows)]
+fn encode_windows_host_console_name(
+    console_out_path: &Path,
+    console_in_path: Option<&Path>,
+) -> String {
+    format!(
+        "{}{}|{}",
+        WINDOWS_FILE_CONSOLE_PREFIX,
+        console_out_path.to_string_lossy(),
+        console_in_path
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    )
+}
+
+/// Safely duplicate the file descriptor (Unix: `dup` via `AsFd`).
+#[cfg(unix)]
 fn duplicate_fd<T: AsFd>(file: T) -> io::Result<File> {
     Ok(file.as_fd().try_clone_to_owned()?.into())
 }

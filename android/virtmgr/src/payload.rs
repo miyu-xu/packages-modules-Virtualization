@@ -23,13 +23,15 @@ use android_system_virtualizationservice::aidl::android::system::virtualizations
     VirtualMachineRawConfig::VirtualMachineRawConfig,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use binder::{wait_for_interface, ParcelFileDescriptor};
+#[cfg(not(windows))]
+use binder::wait_for_interface;
+use binder::ParcelFileDescriptor;
 use log::{info, warn};
 use microdroid_metadata::{ApexPayload, ApkPayload, Metadata, PayloadConfig, PayloadMetadata};
 use microdroid_payload_config::{ApexConfig, VmPayloadConfig};
 use once_cell::sync::OnceCell;
 use packagemanager_aidl::aidl::android::content::pm::{
-    IPackageManagerNative::IPackageManagerNative, StagedApexInfo::StagedApexInfo,
+    IPackageManagerNative::IPackageManagerNative, StagedApexInfo,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -37,14 +39,30 @@ use serde_xml_rs::from_reader;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{metadata, File, OpenOptions};
+#[cfg(windows)]
+use std::io::copy;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
-use vmconfig::open_parcel_file;
+use vmconfig::{open_parcel_file, resolve_host_path};
+#[cfg(windows)]
+use zip::ZipArchive;
 
 const APEX_INFO_LIST_PATH: &str = "/apex/apex-info-list.xml";
 
 const PACKAGE_MANAGER_NATIVE_SERVICE: &str = "package_native";
+#[cfg(windows)]
+const WINDOWS_STAGED_APEX_DIR_ENV: &str = "VIRTMGR_STAGED_APEX_DIR";
+#[cfg(windows)]
+const WINDOWS_STAGED_APEX_JSON: &str = "staged_apexes.json";
+#[cfg(windows)]
+const WINDOWS_STAGED_APEX_STATE_JSON: &str = "staged_state.json";
+#[cfg(windows)]
+const WINDOWS_STAGED_DECOMPRESSED_DIR: &str = "decompressed";
+/// Optional JSON array (same shape as `staged_apexes.json`) to **mock** `IPackageManagerNative`
+/// staged APEX metadata without a directory scan (merged with `VIRTMGR_STAGED_APEX_DIR` when both set).
+#[cfg(windows)]
+const WINDOWS_MOCK_STAGED_APEX_JSON_ENV: &str = "VIRTMGR_MOCK_STAGED_APEX_JSON";
 
 /// Represents the list of APEXes
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -87,15 +105,20 @@ impl ApexInfoList {
     fn load() -> Result<&'static ApexInfoList> {
         static INSTANCE: OnceCell<ApexInfoList> = OnceCell::new();
         INSTANCE.get_or_try_init(|| {
-            let apex_info_list = File::open(APEX_INFO_LIST_PATH)
-                .context(format!("Failed to open {}", APEX_INFO_LIST_PATH))?;
+            let apex_info_list_path = resolve_host_path(Path::new(APEX_INFO_LIST_PATH));
+            #[cfg(windows)]
+            if !apex_info_list_path.exists() {
+                return Ok(ApexInfoList { list: vec![] });
+            }
+            let apex_info_list = File::open(&apex_info_list_path)
+                .with_context(|| format!("Failed to open {}", apex_info_list_path.display()))?;
             let mut apex_info_list: ApexInfoList = from_reader(apex_info_list)
-                .context(format!("Failed to parse {}", APEX_INFO_LIST_PATH))?;
+                .with_context(|| format!("Failed to parse {}", apex_info_list_path.display()))?;
 
             // For active APEXes, we run derive_classpath and parse its output to see if it
             // contributes to the classpath(s). (This allows us to handle any new classpath env
             // vars seamlessly.)
-            if !cfg!(early) {
+            if !cfg!(early) && !cfg!(windows) {
                 let classpath_vars = run_derive_classpath()?;
                 let classpath_apexes = find_apex_names_in_classpath(&classpath_vars)?;
 
@@ -161,6 +184,185 @@ struct PackageManager {
     apex_info_list: &'static ApexInfoList,
 }
 
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+struct WindowsStagedApexEntry {
+    module_name: String,
+    disk_image_path: String,
+    #[serde(default)]
+    version_code: i64,
+    #[serde(default)]
+    has_classpath_jars: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default, Deserialize)]
+struct WindowsStagedState {
+    #[serde(default)]
+    active_modules: Vec<String>,
+}
+
+#[cfg(windows)]
+fn load_windows_staged_state(staged_root: &Path) -> Result<Option<HashSet<String>>> {
+    let state_path = staged_root.join(WINDOWS_STAGED_APEX_STATE_JSON);
+    if !state_path.exists() {
+        return Ok(None);
+    }
+    let file = File::open(&state_path)
+        .with_context(|| format!("Failed to open {}", state_path.display()))?;
+    let state: WindowsStagedState = serde_json::from_reader(file)
+        .with_context(|| format!("Failed to parse {}", state_path.display()))?;
+    let active: HashSet<String> =
+        state.active_modules.into_iter().filter(|m| !m.is_empty()).collect();
+    Ok(Some(active))
+}
+
+#[cfg(windows)]
+fn load_mock_staged_apex_json() -> Result<Vec<StagedApexInfo>> {
+    let path = match std::env::var(WINDOWS_MOCK_STAGED_APEX_JSON_ENV) {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => return Ok(vec![]),
+    };
+    let file = File::open(&path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let entries: Vec<WindowsStagedApexEntry> = serde_json::from_reader(file)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    Ok(entries
+        .into_iter()
+        .map(|e| StagedApexInfo {
+            moduleName: e.module_name,
+            diskImagePath: e.disk_image_path,
+            versionCode: e.version_code,
+            hasClassPathJars: e.has_classpath_jars,
+            ..Default::default()
+        })
+        .collect())
+}
+
+#[cfg(windows)]
+fn extract_original_apex_if_needed(capex_path: &Path, output_path: &Path) -> Result<()> {
+    let refresh = match (metadata(capex_path), metadata(output_path)) {
+        (Ok(source), Ok(target)) => source.modified()? > target.modified()?,
+        (Ok(_), Err(_)) => true,
+        (Err(err), _) => return Err(err.into()),
+    };
+    if !refresh {
+        return Ok(());
+    }
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+
+    let file = File::open(capex_path)
+        .with_context(|| format!("Failed to open {}", capex_path.display()))?;
+    let mut archive =
+        ZipArchive::new(file).with_context(|| format!("Failed to read {}", capex_path.display()))?;
+    let mut entry = archive.by_name("original_apex").with_context(|| {
+        format!("CAPEX does not contain original_apex: {}", capex_path.display())
+    })?;
+    let mut output = File::create(output_path)
+        .with_context(|| format!("Failed to create {}", output_path.display()))?;
+    copy(&mut entry, &mut output)
+        .with_context(|| format!("Failed to extract {}", output_path.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_windows_staged_disk_image_path(staged_root: &Path, disk_image_path: &str) -> Result<PathBuf> {
+    let mut path = PathBuf::from(disk_image_path);
+    if path.is_relative() {
+        path = staged_root.join(path);
+    }
+    if path.extension().and_then(OsStr::to_str) == Some("capex") {
+        let module_name = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| anyhow!("Invalid staged CAPEX path {}", path.display()))?;
+        let decompressed = staged_root
+            .join(WINDOWS_STAGED_DECOMPRESSED_DIR)
+            .join(format!("{module_name}.apex"));
+        extract_original_apex_if_needed(&path, &decompressed)?;
+        return Ok(decompressed);
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn collect_windows_staged_apexes() -> Result<Vec<StagedApexInfo>> {
+    let mut out = load_mock_staged_apex_json()?;
+
+    let staged_root = match std::env::var(WINDOWS_STAGED_APEX_DIR_ENV) {
+        Ok(s) if !s.is_empty() => PathBuf::from(s),
+        _ => {
+            if out.is_empty() {
+                bail!(
+                    "prefer_staged on Windows requires VIRTMGR_STAGED_APEX_DIR \
+                     and/or VIRTMGR_MOCK_STAGED_APEX_JSON"
+                );
+            }
+            return Ok(out);
+        }
+    };
+
+    if !staged_root.is_dir() {
+        bail!("VIRTMGR_STAGED_APEX_DIR is not a directory: {}", staged_root.display());
+    }
+    let active_modules = load_windows_staged_state(&staged_root)?;
+
+    let json_path = staged_root.join(WINDOWS_STAGED_APEX_JSON);
+    if json_path.exists() {
+        let file = File::open(&json_path)
+            .with_context(|| format!("Failed to open {}", json_path.display()))?;
+        let mut entries: Vec<WindowsStagedApexEntry> = serde_json::from_reader(file)
+            .with_context(|| format!("Failed to parse {}", json_path.display()))?;
+        if let Some(active) = &active_modules {
+            entries.retain(|e| active.contains(&e.module_name));
+        }
+        for entry in entries {
+            let disk_image_path =
+                resolve_windows_staged_disk_image_path(&staged_root, &entry.disk_image_path)?;
+            out.push(StagedApexInfo {
+                moduleName: entry.module_name,
+                diskImagePath: disk_image_path.to_string_lossy().to_string(),
+                versionCode: entry.version_code,
+                hasClassPathJars: entry.has_classpath_jars,
+                ..Default::default()
+            });
+        }
+        return Ok(out);
+    }
+
+    for entry in std::fs::read_dir(&staged_root)
+        .with_context(|| format!("Failed to read {}", staged_root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let extension = path.extension().and_then(OsStr::to_str);
+        if extension != Some("apex") && extension != Some("capex") {
+            continue;
+        }
+        let module = match path.file_stem().and_then(OsStr::to_str) {
+            Some(m) if !m.is_empty() => m.to_string(),
+            _ => continue,
+        };
+        if let Some(active) = &active_modules {
+            if !active.contains(&module) {
+                continue;
+            }
+        }
+        out.push(StagedApexInfo {
+            moduleName: module,
+            diskImagePath: resolve_windows_staged_disk_image_path(&staged_root, &path.to_string_lossy())
+                .map(|p| p.to_string_lossy().to_string())?,
+            versionCode: 0,
+            hasClassPathJars: false,
+            ..Default::default()
+        });
+    }
+    Ok(out)
+}
+
 impl PackageManager {
     fn new() -> Result<Self> {
         let apex_info_list = ApexInfoList::load()?;
@@ -172,19 +374,29 @@ impl PackageManager {
         let mut list = self.apex_info_list.clone();
         // When prefer_staged, we override ApexInfo by consulting "package_native"
         if prefer_staged {
-            if cfg!(early) {
-                return Err(anyhow!("Can't turn on prefer_staged on early boot VMs"));
-            }
-            let pm =
-                wait_for_interface::<dyn IPackageManagerNative>(PACKAGE_MANAGER_NATIVE_SERVICE)
-                    .context("Failed to get service when prefer_staged is set.")?;
-            let staged =
-                pm.getStagedApexModuleNames().context("getStagedApexModuleNames failed")?;
-            for name in staged {
-                if let Some(staged_apex_info) =
-                    pm.getStagedApexInfo(&name).context("getStagedApexInfo failed")?
-                {
+            #[cfg(windows)]
+            {
+                let staged = collect_windows_staged_apexes()?;
+                for staged_apex_info in staged {
                     list.override_staged_apex(&staged_apex_info)?;
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                if cfg!(early) {
+                    return Err(anyhow!("Can't turn on prefer_staged on early boot VMs"));
+                }
+                let pm =
+                    wait_for_interface::<dyn IPackageManagerNative>(PACKAGE_MANAGER_NATIVE_SERVICE)
+                        .context("Failed to get service when prefer_staged is set.")?;
+                let staged =
+                    pm.getStagedApexModuleNames().context("getStagedApexModuleNames failed")?;
+                for name in staged {
+                    if let Some(staged_apex_info) =
+                        pm.getStagedApexInfo(&name).context("getStagedApexInfo failed")?
+                    {
+                        list.override_staged_apex(&staged_apex_info)?;
+                    }
                 }
             }
         }
@@ -358,6 +570,10 @@ fn make_payload_disk(
 }
 
 fn run_derive_classpath() -> Result<String> {
+    #[cfg(windows)]
+    {
+        return Ok(String::new());
+    }
     let result = Command::new("/apex/com.android.sdkext/bin/derive_classpath")
         .arg("/proc/self/fd/1")
         .output()

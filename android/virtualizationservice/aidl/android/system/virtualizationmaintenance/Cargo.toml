@@ -1,0 +1,30 @@
+[package]
+name = "android_system_virtualizationmaintenance"
+version = "0.1.0"
+edition = "2021"
+description = "Rust bindings for Android Virtualization AIDL interfaces"
+license = "Apache-2.0"
+
+[lib]
+name = "android_system_virtualizationmaintenance"
+path = "android_system_virtualizationmaintenance.rs"
+
+[dependencies]
+binder = { path = "../../../../../../../../../frameworks/native/libs/binder/rust" }
+android_system_virtualizationcommon = { path = "../virtualizationcommon" }
+async-trait = "0.1.74"
+
+[features]
+default = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(android_vendor)",
+    "cfg(android_ndk)",
+    "cfg(android_vndk)",
+    "cfg(trusty)",
+] }
+
+[profile.release]
+lto = true
+opt-level = "z"

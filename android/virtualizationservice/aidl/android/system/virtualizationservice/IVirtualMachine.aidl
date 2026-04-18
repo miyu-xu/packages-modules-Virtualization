@@ -56,4 +56,11 @@ interface IVirtualMachine {
 
     /** Resumes the suspended VM. */
     void resume();
+
+    /**
+     * Start a host localhost TCP listener and bridge accepted clients to the VM's vsock port.
+     *
+     * Intended for Windows host-side workflows such as `adb connect localhost:<port>`.
+     */
+    void startHostVsockTcpBridge(int hostPort, int guestPort);
 }

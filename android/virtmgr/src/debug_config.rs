@@ -18,9 +18,12 @@ use android_system_virtualizationservice::aidl::android::system::virtualizations
     VirtualMachineAppConfig::DebugLevel::DebugLevel, VirtualMachineConfig::VirtualMachineConfig,
 };
 use anyhow::{anyhow, Context, Error, Result};
+#[cfg(unix)]
 use libfdt::{Fdt, FdtError};
 use log::{info, warn};
 use rustutils::system_properties;
+#[cfg(windows)]
+use serde::Deserialize;
 use std::ffi::{CString, NulError};
 use std::fs;
 use std::io::ErrorKind;
@@ -30,6 +33,8 @@ use vmconfig::get_debug_level;
 
 const CUSTOM_DEBUG_POLICY_OVERLAY_SYSPROP: &str =
     "hypervisor.virtualizationmanager.debug_policy.path";
+#[cfg(windows)]
+const WINDOWS_DEBUG_POLICY_JSON_ENV: &str = "VIRTMGR_DEBUG_POLICY_JSON";
 const DEVICE_TREE_EMPTY_TREE_SIZE_BYTES: usize = 100; // rough estimation.
 
 struct DPPath {
@@ -82,6 +87,7 @@ fn get_debug_policy_bool(path: &Path) -> Result<bool> {
 
 /// Get property value in bool. It's true iff the value is explicitly set to <1>.
 /// It takes path as &str instead of &Path, because we don't want OsStr.
+#[cfg(unix)]
 fn get_fdt_prop_bool(fdt: &Fdt, path: &DPPath) -> Result<bool> {
     let (node_path, prop_name) = (&path.node_path, &path.prop_name);
     let node = match fdt.node(node_path) {
@@ -104,10 +110,12 @@ fn get_fdt_prop_bool(fdt: &Fdt, path: &DPPath) -> Result<bool> {
 }
 
 /// Fdt with owned vector.
+#[cfg(unix)]
 struct OwnedFdt {
     buffer: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl OwnedFdt {
     fn from_overlay_onto_new_fdt(overlay_file_path: &Path) -> Result<Self> {
         let mut overlay_buf = match fs::read(overlay_file_path) {
@@ -157,16 +165,48 @@ pub struct DebugPolicy {
 }
 
 impl DebugPolicy {
+    #[cfg(windows)]
+    fn from_json_file(path: &Path) -> Result<Self> {
+        #[derive(Debug, Default, Deserialize)]
+        struct DebugPolicyJson {
+            #[serde(default)]
+            log: bool,
+            #[serde(default)]
+            ramdump: bool,
+            #[serde(default)]
+            adb: bool,
+        }
+        let file = fs::File::open(path).with_context(|| format!("Failed to open {:?}", path))?;
+        let parsed: DebugPolicyJson =
+            serde_json::from_reader(file).with_context(|| format!("Failed to parse {:?}", path))?;
+        Ok(Self { log: parsed.log, ramdump: parsed.ramdump, adb: parsed.adb })
+    }
+
     /// Build from the passed DTBO path.
     pub fn from_overlay(path: &Path) -> Result<Self> {
-        let owned_fdt = OwnedFdt::from_overlay_onto_new_fdt(path)?;
-        let fdt = owned_fdt.as_fdt();
+        #[cfg(windows)]
+        {
+            let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if strict_parity {
+                return Err(anyhow!(
+                    "VIRTMGR_STRICT_PARITY=1: debug policy DT overlay is unsupported on Windows; provide VIRTMGR_DEBUG_POLICY_JSON"
+                ));
+            }
+            return Self::from_json_file(path).or_else(|_| Ok(Default::default()));
+        }
+        #[cfg(unix)]
+        {
+            let owned_fdt = OwnedFdt::from_overlay_onto_new_fdt(path)?;
+            let fdt = owned_fdt.as_fdt();
 
-        Ok(Self {
-            log: get_fdt_prop_bool(fdt, &DP_LOG_PATH)?,
-            ramdump: get_fdt_prop_bool(fdt, &DP_RAMDUMP_PATH)?,
-            adb: get_fdt_prop_bool(fdt, &DP_ADB_PATH)?,
-        })
+            Ok(Self {
+                log: get_fdt_prop_bool(fdt, &DP_LOG_PATH)?,
+                ramdump: get_fdt_prop_bool(fdt, &DP_RAMDUMP_PATH)?,
+                adb: get_fdt_prop_bool(fdt, &DP_ADB_PATH)?,
+            })
+        }
     }
 
     /// Build from the /avf/guest subtree of the host DT.
@@ -198,6 +238,20 @@ impl DebugConfig {
     }
 
     fn get_debug_policy() -> Option<DebugPolicy> {
+        #[cfg(windows)]
+        {
+            if let Ok(path) = std::env::var(WINDOWS_DEBUG_POLICY_JSON_ENV) {
+                match DebugPolicy::from_json_file(Path::new(&path)) {
+                    Ok(dp) => {
+                        info!("Loaded debug policy from {WINDOWS_DEBUG_POLICY_JSON_ENV}={path}: {dp:?}");
+                        return Some(dp);
+                    }
+                    Err(err) => {
+                        warn!("Failed to load debug policy from {WINDOWS_DEBUG_POLICY_JSON_ENV}: {err:?}");
+                    }
+                }
+            }
+        }
         let dp_sysprop = system_properties::read(CUSTOM_DEBUG_POLICY_OVERLAY_SYSPROP);
         let custom_dp = dp_sysprop.unwrap_or_else(|e| {
             warn!("Failed to read sysprop {CUSTOM_DEBUG_POLICY_OVERLAY_SYSPROP}: {e}");
@@ -251,8 +305,8 @@ impl DebugConfig {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, unix))]
+mod overlay_tests {
     use super::*;
 
     #[test]
@@ -302,6 +356,11 @@ mod tests {
 
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn test_invalid_sysprop_disables_debug_policy() -> Result<()> {

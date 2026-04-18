@@ -1,0 +1,86 @@
+
+[package]
+name = "virtmgr"
+version = "0.1.0"
+edition = "2021"
+authors = ["Android Virtualization Team"]
+description = "Android Virtualization Manager"
+license = "Apache-2.0"
+
+[[bin]]
+name = "virtmgr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde-xml-rs = "0.6"
+log = "0.4"
+env_logger = "0.10"
+android_logger = { path = "../../libs/android_logger" }
+hex = "0.4"
+regex = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+glob = "0.3"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+once_cell = "1.0"
+cfg-if = "1.0"
+libc = "0.2"
+semver = "1.0"
+cstr = "0.2"
+zerocopy = { version = "0.7", features = ["derive"] }
+fsfdt = { path = "../../libs/fsfdt" }
+libfdt = { path = "../../libs/libfdt" }
+
+hypervisor_props = { path = "../../libs/hypervisor_props" }
+nested_virt = { path = "../../libs/nested_virt" }
+microdroid_metadata = { path = "../../libs/microdroid_metadata" }
+selinux_bindgen = { path = "../../libs/selinux_bindgen" }
+
+apkverify = { path = "../../libs/apkverify" }
+avflog = { path = "../../libs/avflog" }
+microdroid_payload_config = { path = "../../libs/microdroid_payload_config" }
+rustutils = { path = "../../libs/rustutils" }
+vbmeta = { path = "../../libs/vbmeta" }
+vmconfig = { path = "../../libs/vmconfig" }
+packagemanager_aidl = { path = "../../libs/packagemanager_aidl" }
+android_os_permissions_aidl = { path = "../../libs/android_os_permissions_aidl" }
+statslog_virtualization_rust = { path = "../../libs/statslog_virtualization_rust" }
+tombstoned_client = { path = "../../libs/tombstoned_client" }
+disk = { path = "../../libs/disk" }
+vm_control = { path = "../../libs/vm_control" }
+
+# Relative to this crate (packages/modules/Virtualization/android/virtmgr) → repo root → frameworks/...
+binder = { path = "../../../../../frameworks/native/libs/binder/rust" }
+rpcbinder = { path = "../../../../../frameworks/native/libs/binder/rust/rpcbinder" }
+
+android_system_virtualizationcommon = { path = "../virtualizationservice/aidl/android/system/virtualizationcommon" }
+android_system_virtualizationservice = { path = "../virtualizationservice/aidl/android/system/virtualizationservice" }
+android_system_virtualizationservice_internal = { path = "../virtualizationservice/aidl/android/system/virtualizationservice_internal" }
+android_system_virtualmachineservice = { path = "../virtualizationservice/aidl/android/system/virtualmachineservice" }
+android_system_virtualizationmaintenance = { path = "../virtualizationservice/aidl/android/system/virtualizationmaintenance" }
+android_hardware_security_secretkeeper = { path = "../virtualizationservice/aidl/android/hardware/security/secretkeeper" }
+android_hardware_security_authgraph = { path = "../virtualizationservice/aidl/android/hardware/security/authgraph" }
+avf_features = { path = "../../libs/avf_features" }
+
+[target.'cfg(unix)'.dependencies]
+nix = "0.28"
+command-fds = "0.3"
+shared_child = "1.0"
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+vsock = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+shared_child = "1.0"
+windows-sys = { version = "0.48", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+] }
