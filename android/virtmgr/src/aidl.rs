@@ -20,7 +20,7 @@ use crate::composite::make_composite_image;
 use crate::crosvm::{AudioConfig, CrosvmConfig, DiskFile, DisplayConfig, GpuConfig, InputDeviceOption, PayloadState, UsbConfig, VmContext, VmInstance, VmState};
 use crate::debug_config::DebugConfig;
 use crate::dt_overlay::{create_device_tree_overlay, VM_DT_OVERLAY_MAX_SIZE, VM_DT_OVERLAY_PATH};
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 use crate::host_internal_service;
 use crate::payload::{add_microdroid_payload_images, add_microdroid_system_images, add_microdroid_vendor_image};
 use crate::selinux::{getfilecon, SeContext};
@@ -92,7 +92,6 @@ use crate::os_compat::{AsRawFd, FromRawFd, IntoRawFd};
 use crate::os_compat::pid_t;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak, LazyLock};
-#[cfg(windows)]
 use std::sync::Once;
 use vbmeta::VbMetaImage;
 use vmconfig::{VmConfig, get_debug_level, resolve_host_path};
@@ -145,7 +144,7 @@ pub static GLOBAL_SERVICE: LazyLock<Strong<dyn IVirtualizationServiceInternal>> 
     LazyLock::new(|| {
         if cfg!(early) {
             panic!("Early virtmgr must not connect to VirtualizatinoServiceInternal")
-        } else if cfg!(windows) {
+        } else if cfg!(not(target_os = "android")) {
             host_internal_service::global_service()
         } else {
             wait_for_interface(BINDER_SERVICE_IDENTIFIER)
@@ -204,10 +203,7 @@ fn create_or_update_idsig_file(
     sig.write_into(&mut output).context("failed to write idsig")?;
     println!("virtmgr: idsig after write_into");
     #[cfg(windows)]
-    debug_trace(format!(
-        "virtmgr: idsig after output_len={}",
-        output.metadata()?.len()
-    ));
+    debug_trace(format!("virtmgr: idsig after output_len={}", output.metadata()?.len()));
     Ok(())
 }
 
@@ -354,7 +350,7 @@ impl IVirtualizationService for VirtualizationService {
     /// Get a list of all currently running VMs. This method is only intended for debug purposes,
     /// and as such is only permitted from the shell user.
     fn debugListVms(&self) -> binder::Result<Vec<VirtualMachineDebugInfo>> {
-        #[cfg(windows)]
+        #[cfg(not(target_os = "android"))]
         {
             check_manage_access()?;
             let state = self.state.lock().unwrap();
@@ -370,7 +366,7 @@ impl IVirtualizationService for VirtualizationService {
                 })
                 .collect());
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "android")]
         {
             // Delegate to the global service, including checking the debug permission.
             GLOBAL_SERVICE.debugListVms()
@@ -536,9 +532,9 @@ impl VirtualizationService {
         &self,
         requester_debug_pid: pid_t,
     ) -> binder::Result<(VmContext, Cid, PathBuf)> {
-        const NUM_ATTEMPTS: usize = 5;
+        let num_attempts = if cfg!(target_os = "android") { 5 } else { 64 };
 
-        for _ in 0..NUM_ATTEMPTS {
+        for _ in 0..num_attempts {
             let vm_context = GLOBAL_SERVICE.allocateGlobalVmContext(requester_debug_pid)?;
             let cid = vm_context.getCid()? as Cid;
             let temp_dir: PathBuf = vm_context.getTemporaryDirectory()?.into();
@@ -936,7 +932,7 @@ fn maybe_create_device_tree_overlay(
     config: &VirtualMachineConfig,
     temporary_directory: &Path,
 ) -> binder::Result<Option<File>> {
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     {
         let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -952,13 +948,13 @@ fn maybe_create_device_tree_overlay(
         if strict_parity {
             let _ = config;
             return Err(anyhow!(
-                "VIRTMGR_STRICT_PARITY=1: DT overlay unsupported on Windows without VIRTMGR_DT_OVERLAY_JSON"
+                "VIRTMGR_STRICT_PARITY=1: DT overlay unsupported on desktop host without VIRTMGR_DT_OVERLAY_JSON"
             ))
             .or_binder_exception(ExceptionCode::UNSUPPORTED_OPERATION);
         }
         return Ok(None);
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
     {
         // Currently, VirtMgr adds the host copy of reference DT & untrusted properties
         // (e.g. instance-id)
@@ -1241,7 +1237,7 @@ fn load_app_config(
     // It is safe to construct a filename based on the os_name because we've already checked that it
     // is one of the allowed values.
     let vm_config_path = {
-        #[cfg(windows)]
+        #[cfg(not(target_os = "android"))]
         {
             if let Ok(custom_json) = std::env::var("VIRTMGR_MICRODROID_JSON") {
                 PathBuf::from(custom_json)
@@ -1252,20 +1248,25 @@ fn load_app_config(
                 if apex_json.exists() {
                     apex_json
                 } else {
-                    PathBuf::from(format!(
-                        "C:/workspace/aosp/packages/modules/Virtualization/build/microdroid/{os_name}.json"
-                    ))
+                    let fallback = PathBuf::from(format!(
+                        "packages/modules/Virtualization/build/microdroid/{os_name}.json"
+                    ));
+                    if fallback.exists() {
+                        fallback
+                    } else {
+                        apex_json
+                    }
                 }
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "android")]
         {
             PathBuf::from(format!("/apex/com.android.virt/etc/{}.json", os_name))
         }
     };
     let vm_config_file = File::open(vm_config_path)?;
     let mut vm_config = VmConfig::load(&vm_config_file)?.to_parcelable()?;
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     {
         let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1273,26 +1274,28 @@ fn load_app_config(
         if config.protectedVm {
             if strict_parity {
                 bail!(
-                    "VIRTMGR_STRICT_PARITY=1: protectedVm is not Android-equivalent on Windows host"
+                    "VIRTMGR_STRICT_PARITY=1: protectedVm is not Android-equivalent on desktop host"
                 );
             }
-            warn!("Windows host mode: protectedVm is accepted but not Android-equivalent in isolation semantics");
+            warn!("Desktop host runtime: protectedVm is accepted but not Android-equivalent in isolation semantics");
         }
         if config.hugePages {
             if strict_parity {
                 bail!(
-                    "VIRTMGR_STRICT_PARITY=1: hugePages parity is not guaranteed on Windows host"
+                    "VIRTMGR_STRICT_PARITY=1: hugePages parity is not guaranteed on desktop host"
                 );
             }
-            warn!("Windows host mode: hugePages is accepted but backend behavior may differ");
+            warn!("Desktop host runtime: hugePages is accepted but backend behavior may differ");
         }
         if config.boostUclamp {
             if strict_parity {
                 bail!(
-                    "VIRTMGR_STRICT_PARITY=1: boostUclamp parity is not guaranteed on Windows host"
+                    "VIRTMGR_STRICT_PARITY=1: boostUclamp parity is not guaranteed on desktop host"
                 );
             }
-            warn!("Windows host mode: boostUclamp is accepted but scheduler behavior may differ");
+            warn!(
+                "Desktop host runtime: boostUclamp is accepted but scheduler behavior may differ"
+            );
         }
     }
 
@@ -1311,7 +1314,7 @@ fn load_app_config(
 
         vm_config.devices.clone_from(&custom_config.devices);
         vm_config.networkSupported = custom_config.networkSupported;
-        #[cfg(windows)]
+        #[cfg(not(target_os = "android"))]
         {
             let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1319,20 +1322,20 @@ fn load_app_config(
             if !custom_config.devices.is_empty() {
                 if strict_parity {
                     bail!(
-                        "VIRTMGR_STRICT_PARITY=1: customConfig.devices is not Android-equivalent on Windows host"
+                        "VIRTMGR_STRICT_PARITY=1: customConfig.devices is not Android-equivalent on desktop host"
                     );
                 }
                 warn!(
-                    "Windows host mode: customConfig.devices is accepted but device-assignment semantics may differ"
+                    "Desktop host runtime: customConfig.devices is accepted but device-assignment semantics may differ"
                 );
             }
             if custom_config.networkSupported {
                 if strict_parity {
                     bail!(
-                        "VIRTMGR_STRICT_PARITY=1: networkSupported parity is not guaranteed on Windows host"
+                        "VIRTMGR_STRICT_PARITY=1: networkSupported parity is not guaranteed on desktop host"
                     );
                 }
-                warn!("Windows host mode: networkSupported is accepted but backend may differ");
+                warn!("Desktop host runtime: networkSupported is accepted but backend may differ");
             }
         }
 
@@ -1370,7 +1373,7 @@ fn load_app_config(
 }
 
 fn check_partition_for_file(fd: &ParcelFileDescriptor) -> Result<()> {
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
     {
         let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
         let link = fs::read_link(&path).context(format!("can't read_link {path}"))?;
@@ -1386,7 +1389,7 @@ fn check_partition_for_file(fd: &ParcelFileDescriptor) -> Result<()> {
             bail!("vendor or odm file {} can't be used for VM", link.display());
         }
     }
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     {
         let _ = fd;
     }
@@ -1463,7 +1466,7 @@ struct CompositeImageFilenames {
 
 /// Checks whether the caller has a specific permission
 fn check_permission(perm: &str) -> binder::Result<()> {
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     {
         if let Some(allowlist) = parse_allowlist_from_env_or_file(
             "VIRTMGR_MOCK_PERMISSION_ALLOWLIST",
@@ -1488,12 +1491,12 @@ fn check_permission(perm: &str) -> binder::Result<()> {
         }
         static WARN_ONCE: Once = Once::new();
         WARN_ONCE.call_once(|| {
-            warn!("Windows host mode: permission checks are bypassed (permission service unavailable)");
+            warn!("Host runtime mode: permission checks are bypassed (Android permission service unavailable)");
         });
         let _ = perm;
         return Ok(());
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
     {
         if cfg!(early) {
             // Skip permission check for early VMs, in favor of SELinux
@@ -1542,7 +1545,7 @@ fn is_safe_raw_partition(label: &str) -> bool {
     label == "vm-instance"
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 fn parse_allowlist_from_env_or_file(
     env_csv_key: &str,
     env_file_key: &str,
@@ -1594,7 +1597,7 @@ fn check_label_is_allowed(context: &SeContext) -> Result<()> {
 }
 
 fn check_label_for_partition(partition: &Partition) -> Result<()> {
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     {
         if let Some(allowlist) = parse_allowlist_from_env_or_file(
             "VIRTMGR_MOCK_SELINUX_LABEL_ALLOWLIST",
@@ -1613,12 +1616,12 @@ fn check_label_for_partition(partition: &Partition) -> Result<()> {
         }
         static WARN_ONCE: Once = Once::new();
         WARN_ONCE.call_once(|| {
-            warn!("Windows host mode: SELinux label checks are bypassed");
+            warn!("Host runtime mode: SELinux label checks are bypassed");
         });
         let _ = partition;
         return Ok(());
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
     {
         let file = partition.image.as_ref().unwrap().as_ref();
         check_label_is_allowed(&getfilecon(file)?)
@@ -1636,7 +1639,7 @@ fn check_label_for_kernel_files(kernel: &Option<File>, initrd: &Option<File>) ->
     Ok(())
 }
 fn check_label_for_file(file: &File, name: &str) -> Result<()> {
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     {
         if let Some(allowlist) = parse_allowlist_from_env_or_file(
             "VIRTMGR_MOCK_SELINUX_LABEL_ALLOWLIST",
@@ -1655,12 +1658,12 @@ fn check_label_for_file(file: &File, name: &str) -> Result<()> {
         }
         static WARN_ONCE: Once = Once::new();
         WARN_ONCE.call_once(|| {
-            warn!("Windows host mode: SELinux label checks are bypassed");
+            warn!("Host runtime mode: SELinux label checks are bypassed");
         });
         let _ = (file, name);
         return Ok(());
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
     {
         check_label_is_allowed(&getfilecon(file)?).with_context(|| format!("{} file invalid", name))
     }
@@ -1783,28 +1786,29 @@ impl IVirtualMachine for VirtualMachine {
             return Err(anyhow!("VM is not running")).or_service_specific_exception(-1);
         }
         if hostPort <= 0 || hostPort > u16::MAX as i32 {
-            return Err(anyhow!("Invalid host TCP port {hostPort}")).or_service_specific_exception(-1);
+            return Err(anyhow!("Invalid host TCP port {hostPort}"))
+                .or_service_specific_exception(-1);
         }
         if guestPort < 1024 {
             return Err(anyhow!("Invalid guest vsock port {guestPort}"))
                 .or_service_specific_exception(-1);
         }
 
-        #[cfg(windows)]
+        #[cfg(not(target_os = "android"))]
         {
             self.instance
                 .start_host_vsock_tcp_bridge(hostPort as u16, guestPort as u32)
                 .with_context(|| {
                     format!(
-                        "Error starting Windows host TCP bridge on 127.0.0.1:{hostPort} -> guest vsock:{guestPort}"
+                        "Error starting host TCP bridge on 127.0.0.1:{hostPort} -> guest vsock:{guestPort}"
                     )
                 })
                 .with_log()
                 .or_service_specific_exception(-1)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "android")]
         {
-            Err(anyhow!("startHostVsockTcpBridge is only supported on Windows hosts"))
+            Err(anyhow!("startHostVsockTcpBridge is only supported on desktop host runtimes"))
                 .or_service_specific_exception(-1)
         }
     }
@@ -1835,10 +1839,10 @@ impl Drop for VirtualMachine {
     fn drop(&mut self) {
         eprintln!("virtmgr: dropping VirtualMachine cid={}", self.instance.cid);
         debug!("Dropping {:?}", self);
-        #[cfg(windows)]
+        #[cfg(not(target_os = "android"))]
         if std::env::var_os("VIRTMGR_SERVICE_DIR").is_some() {
             debug!(
-                "Persistent Windows virtmgr mode active; keeping VM with CID {} alive after binder drop",
+                "Persistent host virtmgr mode active; keeping VM with CID {} alive after binder drop",
                 self.instance.cid
             );
             return;
@@ -1950,16 +1954,15 @@ impl State {
 
     /// Add a new VM to the list.
     fn add_vm(&mut self, vm: Arc<VmInstance>, binder: Strong<dyn IVirtualMachine>) {
-        self.vms
-            .retain(|(vm, _)| !matches!(&*vm.vm_state.lock().unwrap(), VmState::Dead | VmState::Failed));
+        self.vms.retain(|(vm, _)| {
+            !matches!(&*vm.vm_state.lock().unwrap(), VmState::Dead | VmState::Failed)
+        });
         self.vms.push((vm, binder));
     }
 
     /// Get a VM that corresponds to the given cid
     fn get_vm(&self, cid: Cid) -> Option<Arc<VmInstance>> {
-        self.vms
-            .iter()
-            .find_map(|(vm, _)| if vm.cid == cid { Some(vm.clone()) } else { None })
+        self.vms.iter().find_map(|(vm, _)| if vm.cid == cid { Some(vm.clone()) } else { None })
     }
 }
 
@@ -2286,6 +2289,7 @@ impl IVirtualMachineService for VirtualMachineService {
         }
     }
 
+    #[cfg(target_os = "android")]
     fn getSecretkeeper(&self) -> binder::Result<Strong<dyn ISecretkeeper>> {
         if !is_secretkeeper_supported() {
             return Err(StatusCode::NAME_NOT_FOUND)?;
@@ -2294,14 +2298,25 @@ impl IVirtualMachineService for VirtualMachineService {
         Ok(BnSecretkeeper::new_binder(SecretkeeperProxy(sk), BinderFeatures::default()))
     }
 
+    #[cfg(not(target_os = "android"))]
+    fn getSecretkeeper(&self) -> binder::Result<Strong<dyn ISecretkeeper>> {
+        Err(StatusCode::NAME_NOT_FOUND)?
+    }
+
     fn requestAttestation(&self, csr: &[u8], test_mode: bool) -> binder::Result<Vec<Certificate>> {
         GLOBAL_SERVICE.requestAttestation(csr, get_calling_uid() as i32, test_mode)
     }
 }
 
+#[cfg(target_os = "android")]
 fn is_secretkeeper_supported() -> bool {
     binder::is_declared(SECRETKEEPER_IDENTIFIER)
         .expect("Could not check for declared Secretkeeper interface")
+}
+
+#[cfg(not(target_os = "android"))]
+fn is_secretkeeper_supported() -> bool {
+    false
 }
 
 impl VirtualMachineService {

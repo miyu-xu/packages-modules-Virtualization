@@ -41,4 +41,29 @@ pub mod system_properties {
         }
         Ok(None)
     }
+
+    pub fn read_bool(key: &str, default: bool) -> Result<bool> {
+        let Some(value) = read(key)? else {
+            return Ok(default);
+        };
+
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(default);
+        }
+
+        match value {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            _ if value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("y")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on") => Ok(true),
+            _ if value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("n")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("off") => Ok(false),
+            _ => anyhow::bail!("Invalid boolean property {key}={value}"),
+        }
+    }
 }

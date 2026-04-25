@@ -136,16 +136,20 @@ pub fn open_parcel_file(path: &Path, _writable: bool) -> Result<ParcelFileDescri
 }
 
 pub fn resolve_host_path(path: &Path) -> PathBuf {
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     {
         if path.exists() {
             return path.to_path_buf();
         }
         let raw = path.to_string_lossy();
+        #[cfg(windows)]
         let android_root = std::env::var("VIRTMGR_ANDROID_ROOT")
             .unwrap_or_else(|_| "C:/workspace/aosp".to_string());
         let map_prefix = |prefix: &str, env_key: &str| -> Option<PathBuf> {
+            #[cfg(windows)]
             let root = std::env::var(env_key).unwrap_or_else(|_| format!("{android_root}{prefix}"));
+            #[cfg(not(windows))]
+            let root = std::env::var(env_key).ok()?;
             raw.strip_prefix(prefix).map(|rest| {
                 let rest = rest.trim_start_matches('/');
                 Path::new(&root).join(rest)
@@ -162,7 +166,7 @@ pub fn resolve_host_path(path: &Path) -> PathBuf {
         }
         path.to_path_buf()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "android")]
     {
         path.to_path_buf()
     }

@@ -31,26 +31,51 @@ use create_idsig::command_create_idsig;
 use create_partition::command_create_partition;
 use run::{command_run, command_run_app, command_run_microdroid};
 use serde::Serialize;
+#[cfg(not(target_os = "android"))]
+use std::fs::OpenOptions;
 use std::io;
 #[cfg(unix)]
 use std::io::IsTerminal;
-#[cfg(windows)]
-use std::io::{BufRead, Seek, SeekFrom, Write};
+#[cfg(not(target_os = "android"))]
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU16;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::fs::OpenOptions;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Command;
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 use std::thread;
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 const WINDOWS_FILE_CONSOLE_PREFIX: &str = "win-file-console|";
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn attach_unix_console(host_console_name: &str) -> Result<(), Error> {
+    let console = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(host_console_name)
+        .with_context(|| format!("Failed to open console tty {host_console_name}"))?;
+    let mut console_reader = console
+        .try_clone()
+        .with_context(|| format!("Failed to clone console tty {host_console_name}"))?;
+    let input_thread = thread::spawn(move || -> io::Result<()> {
+        let mut stdin = io::stdin().lock();
+        let mut console_writer = console;
+        let _ = io::copy(&mut stdin, &mut console_writer)?;
+        Ok(())
+    });
+
+    let mut stdout = io::stdout().lock();
+    io::copy(&mut console_reader, &mut stdout)
+        .with_context(|| format!("Failed to read console tty {host_console_name}"))?;
+    stdout.flush().context("Failed to flush console output")?;
+    let _ = input_thread.join();
+    Ok(())
+}
 
 struct ConnectedService {
     _virtmgr: vmclient::VirtualizationService,
@@ -137,7 +162,7 @@ pub struct DebugConfig {
     gdb: Option<NonZeroU16>,
 
     /// Listen on localhost:<port> and bridge accepted TCP clients to guest vsock:5555.
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     #[arg(long)]
     adb_tcp_port: Option<NonZeroU16>,
 
@@ -160,7 +185,7 @@ impl DebugConfig {
 
     fn adb_tcp_port(&self) -> Option<u16> {
         cfg_if::cfg_if! {
-            if #[cfg(windows)] {
+            if #[cfg(not(target_os = "android"))] {
                 self.adb_tcp_port.map(NonZeroU16::get)
             } else {
                 None
@@ -392,12 +417,12 @@ enum Opt {
         cid: Option<i32>,
 
         /// Exit after reading console output for the given number of seconds.
-        #[cfg(windows)]
+        #[cfg(not(target_os = "android"))]
         #[arg(long)]
         timeout_secs: Option<u64>,
 
         /// Do not forward local stdin into the VM console input file.
-        #[cfg(windows)]
+        #[cfg(not(target_os = "android"))]
         #[arg(long)]
         read_only: bool,
     },
@@ -474,19 +499,17 @@ fn main() -> Result<(), Error> {
         }
         Opt::Console {
             cid,
-            #[cfg(windows)]
+            #[cfg(not(target_os = "android"))]
             timeout_secs,
-            #[cfg(windows)]
+            #[cfg(not(target_os = "android"))]
             read_only,
         } => {
-            #[cfg(windows)]
+            #[cfg(not(target_os = "android"))]
             {
                 command_console(cid, timeout_secs, read_only)
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "android")]
             {
-                let _ = timeout_secs;
-                let _ = read_only;
                 command_console(cid)
             }
         }
@@ -563,7 +586,7 @@ fn command_info() -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "android")]
 fn command_console(cid: Option<i32>) -> Result<(), Error> {
     if !io::stdin().is_terminal() {
         bail!("Stdin must be a terminal (tty). Use 'adb shell -t' to force allocate tty.");
@@ -597,7 +620,10 @@ fn parse_windows_console_info(raw: Option<String>, temp_dir: &str) -> Option<Win
                 return None;
             }
             let input = parts.next().map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from);
-            return Some(WindowsConsoleInfo { output_path: PathBuf::from(output), input_path: input });
+            return Some(WindowsConsoleInfo {
+                output_path: PathBuf::from(output),
+                input_path: input,
+            });
         }
 
         if !raw.trim().is_empty() {
@@ -667,27 +693,29 @@ fn tail_console_output(output_path: &PathBuf, timeout_secs: Option<u64>) -> Resu
 }
 
 #[cfg(windows)]
-fn command_console(cid: Option<i32>, timeout_secs: Option<u64>, read_only: bool) -> Result<(), Error> {
-    #[cfg(windows)]
-    {
-        let service = get_service()?;
-        let mut vms = service.as_ref().debugListVms().context("Failed to get list of VMs")?;
-        if let Some(cid) = cid {
-            vms.retain(|vm_info| vm_info.cid == cid);
+fn command_console(
+    cid: Option<i32>,
+    timeout_secs: Option<u64>,
+    read_only: bool,
+) -> Result<(), Error> {
+    let service = get_service()?;
+    let mut vms = service.as_ref().debugListVms().context("Failed to get list of VMs")?;
+    if let Some(cid) = cid {
+        vms.retain(|vm_info| vm_info.cid == cid);
+    }
+    let vm_info = match vms.len() {
+        0 => bail!("Failed to get VM with console"),
+        1 => vms.remove(0),
+        _ => {
+            let cids: Vec<_> = vms.iter().map(|vm| vm.cid).collect();
+            bail!("Multiple VMs are running; specify a CID with `vm console <cid>`. Available CIDs: {:?}", cids);
         }
-        let vm_info = match vms.len() {
-            0 => bail!("Failed to get VM with console"),
-            1 => vms.remove(0),
-            _ => {
-                let cids: Vec<_> = vms.iter().map(|vm| vm.cid).collect();
-                bail!("Multiple VMs are running; specify a CID with `vm console <cid>`. Available CIDs: {:?}", cids);
-            }
-        };
+    };
 
-        let console = parse_windows_console_info(vm_info.hostConsoleName, &vm_info.temporaryDirectory)
-            .context("Failed to resolve Windows console paths for the VM")?;
-
-        eprintln!("Connecting to Windows VM console for CID {}", vm_info.cid);
+    if let Some(console) =
+        parse_windows_console_info(vm_info.hostConsoleName.clone(), &vm_info.temporaryDirectory)
+    {
+        eprintln!("Connecting to host VM console for CID {}", vm_info.cid);
         eprintln!("Console output: {}", console.output_path.display());
         if let Some(input_path) = &console.input_path {
             eprintln!("Console input : {}", input_path.display());
@@ -699,8 +727,54 @@ fn command_console(cid: Option<i32>, timeout_secs: Option<u64>, read_only: bool)
             }
         }
 
-        tail_console_output(&console.output_path, timeout_secs)
+        return tail_console_output(&console.output_path, timeout_secs);
     }
+
+    #[cfg(unix)]
+    {
+        if !io::stdin().is_terminal() {
+            bail!("Stdin must be a terminal (tty).");
+        }
+        let host_console_name =
+            vm_info.hostConsoleName.context("Failed to get host console metadata for the VM")?;
+        Err(Command::new("microcom").arg(host_console_name).exec().into())
+    }
+    #[cfg(windows)]
+    {
+        bail!("Failed to resolve host console metadata for the VM")
+    }
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn command_console(
+    cid: Option<i32>,
+    _timeout_secs: Option<u64>,
+    _read_only: bool,
+) -> Result<(), Error> {
+    if !io::stdin().is_terminal() {
+        bail!("Stdin must be a terminal (tty).");
+    }
+    let service = get_service()?;
+    let mut vms = service.as_ref().debugListVms().context("Failed to get list of VMs")?;
+    if let Some(cid) = cid {
+        vms.retain(|vm_info| vm_info.cid == cid);
+    }
+    let vm_info = match vms.len() {
+        0 => bail!("Failed to get VM with console"),
+        1 => vms.remove(0),
+        _ => {
+            let cids: Vec<_> = vms.iter().map(|vm| vm.cid).collect();
+            bail!(
+                "Multiple VMs are running; specify a CID with `vm console <cid>`. Available CIDs: {:?}",
+                cids
+            );
+        }
+    };
+    let host_console_name =
+        vm_info.hostConsoleName.context("Failed to get host console metadata for the VM")?;
+    eprintln!("Connecting to host VM console for CID {}", vm_info.cid);
+    eprintln!("Console tty   : {}", host_console_name);
+    attach_unix_console(&host_console_name)
 }
 
 #[cfg(test)]

@@ -48,7 +48,7 @@ pub(crate) const VM_DT_OVERLAY_MAX_SIZE: usize = 2000;
 ///     };
 /// };
 /// ```
-#[cfg(unix)]
+#[cfg(target_os = "android")]
 pub(crate) fn create_device_tree_overlay<'a>(
     buffer: &'a mut [u8],
     dt_path: Option<&'a Path>,
@@ -125,17 +125,17 @@ pub(crate) fn create_device_tree_overlay<'a>(
     Ok(fdt)
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 pub(crate) fn create_device_tree_overlay<'a>(
     _buffer: &'a mut [u8],
     _dt_path: Option<&'a Path>,
     _untrusted_props: &[(&'a CStr, &'a [u8])],
     _trusted_props: &[(&'a CStr, &'a [u8])],
 ) -> Result<&'a mut Fdt> {
-    Err(anyhow!("device tree overlay is not supported on Windows host builds"))
+    Err(anyhow!("device tree overlay is not supported on desktop host builds"))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "android"))]
 mod tests {
     use super::*;
 

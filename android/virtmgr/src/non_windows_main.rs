@@ -13,7 +13,13 @@ use nix::unistd::write;
 #[cfg(unix)]
 use rustutils::inherited_fd::take_fd_ownership;
 #[cfg(unix)]
-use std::os::unix::io::{AsFd, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+use std::path::PathBuf;
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock::{WSAStartup, WSADATA};
 #[cfg(windows)]
@@ -34,7 +40,10 @@ fn ensure_winsock_init() {
 struct Args {
     #[cfg(unix)]
     #[clap(long)]
-    rpc_server_fd: RawFd,
+    rpc_server_fd: Option<RawFd>,
+    #[cfg(unix)]
+    #[clap(long)]
+    rpc_server_path: Option<PathBuf>,
     #[cfg(unix)]
     #[clap(long)]
     ready_fd: RawFd,
@@ -69,10 +78,25 @@ pub fn run() {
 
     let args = Args::parse();
     #[cfg(unix)]
-    let rpc_server_fd =
-        take_fd_ownership(args.rpc_server_fd).expect("Failed to take ownership of rpc_server_fd");
-    #[cfg(unix)]
     let ready_fd = take_fd_ownership(args.ready_fd).expect("Failed to take ownership of ready_fd");
+    #[cfg(unix)]
+    let rpc_server = match (args.rpc_server_fd, args.rpc_server_path) {
+        (Some(rpc_server_fd), None) => Some((false, unsafe {
+            OwnedFd::from_raw_fd(
+                take_fd_ownership(rpc_server_fd)
+                    .expect("Failed to take ownership of rpc_server_fd"),
+            )
+        })),
+        (None, Some(rpc_server_path)) => {
+            let _ = std::fs::remove_file(&rpc_server_path);
+            let listener = UnixListener::bind(&rpc_server_path).unwrap_or_else(|err| {
+                panic!("Failed to bind rpc server path {}: {err}", rpc_server_path.display())
+            });
+            let listener_fd = unsafe { OwnedFd::from_raw_fd(listener.into_raw_fd()) };
+            Some((true, listener_fd))
+        }
+        _ => panic!("Exactly one of --rpc-server-fd or --rpc-server-path must be provided"),
+    };
 
     #[cfg(not(windows))]
     ProcessState::start_thread_pool();
@@ -104,8 +128,13 @@ pub fn run() {
     let service =
         BnVirtualizationService::new_binder(service, BinderFeatures::default()).as_binder();
     #[cfg(unix)]
-    let server = RpcServer::new_unix_domain_bootstrap(service, rpc_server_fd)
-        .expect("Failed to start RpcServer");
+    let server = match rpc_server.expect("unix rpc server config must be present") {
+        (true, rpc_server_fd) => {
+            RpcServer::new_bound_socket(service, rpc_server_fd).expect("Failed to start RpcServer")
+        }
+        (false, rpc_server_fd) => RpcServer::new_unix_domain_bootstrap(service, rpc_server_fd)
+            .expect("Failed to start RpcServer"),
+    };
     #[cfg(windows)]
     let server = RpcServer::new_vsock(service, HOST_RPC_CID, args.rpc_port as u32)
         .expect("Failed to start RpcServer");
@@ -115,11 +144,10 @@ pub fn run() {
 
     #[cfg(unix)]
     {
-        write(ready_fd.as_fd(), "o".as_bytes())
+        let ready_fd = unsafe { BorrowedFd::borrow_raw(ready_fd) };
+        write(ready_fd, "o".as_bytes())
             .expect("Failed to write a single character through ready_fd");
     }
-    #[cfg(unix)]
-    drop(ready_fd);
     server.join();
     info!("Shutting down VirtualizationService RpcServer");
 }

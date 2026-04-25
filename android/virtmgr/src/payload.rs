@@ -23,7 +23,7 @@ use android_system_virtualizationservice::aidl::android::system::virtualizations
     VirtualMachineRawConfig::VirtualMachineRawConfig,
 };
 use anyhow::{anyhow, bail, Context, Result};
-#[cfg(not(windows))]
+#[cfg(target_os = "android")]
 use binder::wait_for_interface;
 use binder::ParcelFileDescriptor;
 use log::{info, warn};
@@ -39,29 +39,29 @@ use serde_xml_rs::from_reader;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{metadata, File, OpenOptions};
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 use std::io::copy;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 use vmconfig::{open_parcel_file, resolve_host_path};
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 use zip::ZipArchive;
 
 const APEX_INFO_LIST_PATH: &str = "/apex/apex-info-list.xml";
 
 const PACKAGE_MANAGER_NATIVE_SERVICE: &str = "package_native";
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 const WINDOWS_STAGED_APEX_DIR_ENV: &str = "VIRTMGR_STAGED_APEX_DIR";
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 const WINDOWS_STAGED_APEX_JSON: &str = "staged_apexes.json";
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 const WINDOWS_STAGED_APEX_STATE_JSON: &str = "staged_state.json";
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 const WINDOWS_STAGED_DECOMPRESSED_DIR: &str = "decompressed";
 /// Optional JSON array (same shape as `staged_apexes.json`) to **mock** `IPackageManagerNative`
 /// staged APEX metadata without a directory scan (merged with `VIRTMGR_STAGED_APEX_DIR` when both set).
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 const WINDOWS_MOCK_STAGED_APEX_JSON_ENV: &str = "VIRTMGR_MOCK_STAGED_APEX_JSON";
 
 /// Represents the list of APEXes
@@ -118,7 +118,7 @@ impl ApexInfoList {
             // For active APEXes, we run derive_classpath and parse its output to see if it
             // contributes to the classpath(s). (This allows us to handle any new classpath env
             // vars seamlessly.)
-            if !cfg!(early) && !cfg!(windows) {
+            if cfg!(target_os = "android") && !cfg!(early) {
                 let classpath_vars = run_derive_classpath()?;
                 let classpath_apexes = find_apex_names_in_classpath(&classpath_vars)?;
 
@@ -184,7 +184,7 @@ struct PackageManager {
     apex_info_list: &'static ApexInfoList,
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Deserialize)]
 struct WindowsStagedApexEntry {
     module_name: String,
@@ -195,14 +195,14 @@ struct WindowsStagedApexEntry {
     has_classpath_jars: bool,
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Default, Deserialize)]
 struct WindowsStagedState {
     #[serde(default)]
     active_modules: Vec<String>,
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 fn load_windows_staged_state(staged_root: &Path) -> Result<Option<HashSet<String>>> {
     let state_path = staged_root.join(WINDOWS_STAGED_APEX_STATE_JSON);
     if !state_path.exists() {
@@ -217,7 +217,7 @@ fn load_windows_staged_state(staged_root: &Path) -> Result<Option<HashSet<String
     Ok(Some(active))
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 fn load_mock_staged_apex_json() -> Result<Vec<StagedApexInfo>> {
     let path = match std::env::var(WINDOWS_MOCK_STAGED_APEX_JSON_ENV) {
         Ok(p) if !p.is_empty() => PathBuf::from(p),
@@ -238,7 +238,7 @@ fn load_mock_staged_apex_json() -> Result<Vec<StagedApexInfo>> {
         .collect())
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 fn extract_original_apex_if_needed(capex_path: &Path, output_path: &Path) -> Result<()> {
     let refresh = match (metadata(capex_path), metadata(output_path)) {
         (Ok(source), Ok(target)) => source.modified()? > target.modified()?,
@@ -256,8 +256,8 @@ fn extract_original_apex_if_needed(capex_path: &Path, output_path: &Path) -> Res
 
     let file = File::open(capex_path)
         .with_context(|| format!("Failed to open {}", capex_path.display()))?;
-    let mut archive =
-        ZipArchive::new(file).with_context(|| format!("Failed to read {}", capex_path.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("Failed to read {}", capex_path.display()))?;
     let mut entry = archive.by_name("original_apex").with_context(|| {
         format!("CAPEX does not contain original_apex: {}", capex_path.display())
     })?;
@@ -268,8 +268,11 @@ fn extract_original_apex_if_needed(capex_path: &Path, output_path: &Path) -> Res
     Ok(())
 }
 
-#[cfg(windows)]
-fn resolve_windows_staged_disk_image_path(staged_root: &Path, disk_image_path: &str) -> Result<PathBuf> {
+#[cfg(not(target_os = "android"))]
+fn resolve_windows_staged_disk_image_path(
+    staged_root: &Path,
+    disk_image_path: &str,
+) -> Result<PathBuf> {
     let mut path = PathBuf::from(disk_image_path);
     if path.is_relative() {
         path = staged_root.join(path);
@@ -279,16 +282,15 @@ fn resolve_windows_staged_disk_image_path(staged_root: &Path, disk_image_path: &
             .file_stem()
             .and_then(OsStr::to_str)
             .ok_or_else(|| anyhow!("Invalid staged CAPEX path {}", path.display()))?;
-        let decompressed = staged_root
-            .join(WINDOWS_STAGED_DECOMPRESSED_DIR)
-            .join(format!("{module_name}.apex"));
+        let decompressed =
+            staged_root.join(WINDOWS_STAGED_DECOMPRESSED_DIR).join(format!("{module_name}.apex"));
         extract_original_apex_if_needed(&path, &decompressed)?;
         return Ok(decompressed);
     }
     Ok(path)
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 fn collect_windows_staged_apexes() -> Result<Vec<StagedApexInfo>> {
     let mut out = load_mock_staged_apex_json()?;
 
@@ -297,7 +299,7 @@ fn collect_windows_staged_apexes() -> Result<Vec<StagedApexInfo>> {
         _ => {
             if out.is_empty() {
                 bail!(
-                    "prefer_staged on Windows requires VIRTMGR_STAGED_APEX_DIR \
+                    "prefer_staged on desktop host requires VIRTMGR_STAGED_APEX_DIR \
                      and/or VIRTMGR_MOCK_STAGED_APEX_JSON"
                 );
             }
@@ -353,8 +355,11 @@ fn collect_windows_staged_apexes() -> Result<Vec<StagedApexInfo>> {
         }
         out.push(StagedApexInfo {
             moduleName: module,
-            diskImagePath: resolve_windows_staged_disk_image_path(&staged_root, &path.to_string_lossy())
-                .map(|p| p.to_string_lossy().to_string())?,
+            diskImagePath: resolve_windows_staged_disk_image_path(
+                &staged_root,
+                &path.to_string_lossy(),
+            )
+            .map(|p| p.to_string_lossy().to_string())?,
             versionCode: 0,
             hasClassPathJars: false,
             ..Default::default()
@@ -374,14 +379,14 @@ impl PackageManager {
         let mut list = self.apex_info_list.clone();
         // When prefer_staged, we override ApexInfo by consulting "package_native"
         if prefer_staged {
-            #[cfg(windows)]
+            #[cfg(not(target_os = "android"))]
             {
                 let staged = collect_windows_staged_apexes()?;
                 for staged_apex_info in staged {
                     list.override_staged_apex(&staged_apex_info)?;
                 }
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "android")]
             {
                 if cfg!(early) {
                     return Err(anyhow!("Can't turn on prefer_staged on early boot VMs"));
@@ -570,7 +575,7 @@ fn make_payload_disk(
 }
 
 fn run_derive_classpath() -> Result<String> {
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     {
         return Ok(String::new());
     }

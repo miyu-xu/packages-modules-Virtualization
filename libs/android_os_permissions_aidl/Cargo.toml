@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-binder = { path = "C:/workspace/aosp/frameworks/native/libs/binder/rust" }
+binder = { path = "../../../../../frameworks/native/libs/binder/rust" }

@@ -42,9 +42,7 @@ fn service_dir() -> Option<PathBuf> {
         "vmclient: VIRTMGR_SERVICE_DIR raw={:?}",
         value.as_ref().map(PathBuf::from)
     ));
-    value
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+    value.filter(|path| !path.is_empty()).map(PathBuf::from)
 }
 
 fn service_state_path(service_dir: &Path) -> PathBuf {
@@ -84,10 +82,7 @@ fn remove_service_state(service_dir: &Path) {
 
 fn try_open_existing_service(service_dir: &Path) -> io::Result<Option<SpawnedVirtmgr>> {
     let state_path = service_state_path(service_dir);
-    debug_trace(format!(
-        "vmclient: checking existing service state path={}",
-        state_path.display()
-    ));
+    debug_trace(format!("vmclient: checking existing service state path={}", state_path.display()));
     let contents = match fs::read_to_string(&state_path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -114,19 +109,13 @@ fn try_open_existing_service(service_dir: &Path) -> io::Result<Option<SpawnedVir
     if ok == 0 || exit_code != STILL_ACTIVE_EXIT_CODE {
         debug_trace(format!(
             "vmclient: existing service pid={} not active (ok={} exit_code={}); removing state",
-            pid,
-            ok,
-            exit_code
+            pid, ok, exit_code
         ));
         remove_service_state(service_dir);
         return Ok(None);
     }
 
-    debug_trace(format!(
-        "vmclient: reusing existing virtmgr pid={} rpc_port={}",
-        pid,
-        rpc_port
-    ));
+    debug_trace(format!("vmclient: reusing existing virtmgr pid={} rpc_port={}", pid, rpc_port));
     Ok(Some(SpawnedVirtmgr { rpc_port, process, terminate_on_drop: false }))
 }
 
@@ -176,9 +165,8 @@ fn spawn_new_virtmgr(exe: &OsStr) -> io::Result<(u32, OwnedHandle, u32)> {
 }
 
 pub fn spawn_virtmgr(virtmgr_exe: &OsStr) -> io::Result<SpawnedVirtmgr> {
-    let exe_owned: OsString = std::env::var_os("VIRTMGR_PATH")
-        .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| {
+    let exe_owned: OsString =
+        std::env::var_os("VIRTMGR_PATH").filter(|path| !path.is_empty()).unwrap_or_else(|| {
             if virtmgr_exe.len() > 0 {
                 virtmgr_exe.to_owned()
             } else {
@@ -189,10 +177,7 @@ pub fn spawn_virtmgr(virtmgr_exe: &OsStr) -> io::Result<SpawnedVirtmgr> {
     debug_trace(format!("vmclient: resolved virtmgr path={}", exe.to_string_lossy()));
 
     if let Some(service_dir) = service_dir() {
-        debug_trace(format!(
-            "vmclient: persistent service mode dir={}",
-            service_dir.display()
-        ));
+        debug_trace(format!("vmclient: persistent service mode dir={}", service_dir.display()));
         fs::create_dir_all(&service_dir)?;
         if let Some(existing) = try_open_existing_service(&service_dir)? {
             return Ok(existing);
@@ -202,8 +187,7 @@ pub fn spawn_virtmgr(virtmgr_exe: &OsStr) -> io::Result<SpawnedVirtmgr> {
         write_service_state(&service_dir, pid, rpc_port)?;
         debug_trace(format!(
             "vmclient: started persistent virtmgr pid={} rpc_port={}",
-            pid,
-            rpc_port
+            pid, rpc_port
         ));
         return Ok(SpawnedVirtmgr { rpc_port, process, terminate_on_drop: false });
     }

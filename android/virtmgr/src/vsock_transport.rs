@@ -24,14 +24,14 @@ use binder::ParcelFileDescriptor;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::fs::File;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::unix::io::IntoRawFd;
+use std::os::unix::io::{FromRawFd, IntoRawFd};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use vsock::VsockStream;
 
 #[cfg(target_os = "macos")]
 use std::fs::File;
 #[cfg(target_os = "macos")]
-use std::os::unix::io::IntoRawFd;
+use std::os::unix::io::{FromRawFd, IntoRawFd};
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream;
 
@@ -113,7 +113,8 @@ pub fn connect(cid: u32, port: u32) -> std::io::Result<OwnedHandle> {
     }
 
     let mut mode = PIPE_READMODE_BYTE;
-    let ok = unsafe { SetNamedPipeHandleState(handle, &mut mode, ptr::null_mut(), ptr::null_mut()) };
+    let ok =
+        unsafe { SetNamedPipeHandleState(handle, &mut mode, ptr::null_mut(), ptr::null_mut()) };
     if ok == 0 {
         let e = std::io::Error::last_os_error();
         unsafe {

@@ -29,15 +29,19 @@ use rustutils::system_properties;
 use shared_child::SharedChild;
 use std::borrow::Cow;
 use std::cmp::max;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{read_to_string, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::mem;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::num::{NonZeroU16, NonZeroU32};
+use std::os::fd::FromRawFd;
 use crate::os_compat::{AsRawFd, ExitStatusExt, IntoRawFd};
 use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, LazyLock};
 use std::time::{Duration, SystemTime};
 use std::thread::{self, JoinHandle};
@@ -55,11 +59,13 @@ use binder::Strong;
 use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::IVirtualMachineService::IVirtualMachineService;
 use tombstoned_client::{TombstonedConnection, DebuggerdDumpType};
 use rpcbinder::RpcServer;
+use std::ffi::OsString;
 
 /// external/crosvm
 use vm_control::{BalloonControlCommand, VmRequest, VmResponse};
 
 const CROSVM_PATH: &str = "/apex/com.android.virt/bin/crosvm";
+const VIRTMGR_CROSVM_PATH: &str = "VIRTMGR_CROSVM_PATH";
 
 /// Version of the platform that crosvm currently implements. The format follows SemVer. This
 /// should be updated when there is a platform change in the crosvm side. Having this value here is
@@ -389,6 +395,7 @@ pub struct VmInstance {
     /// Represents the condition that payload_state was updated
     payload_state_updated: Condvar,
     host_console_name: Mutex<Option<String>>,
+    host_vsock_tcp_bridges: Mutex<HashMap<u16, Arc<AtomicBool>>>,
     /// The human readable name of requester_uid
     requester_uid_name: String,
 }
@@ -421,11 +428,16 @@ impl VmInstance {
             .ok()
             .flatten()
             .map_or_else(|| format!("{}", requester_uid), |u| u.name);
+        let crosvm_control_socket_path = if cfg!(target_os = "android") {
+            temporary_directory.join("crosvm.sock")
+        } else {
+            PathBuf::from("/tmp").join(format!("virtmgr-crosvm-{cid}.sock"))
+        };
         let instance = VmInstance {
             vm_state: Mutex::new(VmState::NotStarted { config: Box::new(config) }),
             vm_context,
             cid,
-            crosvm_control_socket_path: temporary_directory.join("crosvm.sock"),
+            crosvm_control_socket_path,
             name,
             protected,
             temporary_directory,
@@ -437,6 +449,7 @@ impl VmInstance {
             payload_state: Mutex::new(PayloadState::Starting),
             payload_state_updated: Condvar::new(),
             host_console_name: Mutex::new(None),
+            host_vsock_tcp_bridges: Mutex::new(HashMap::new()),
             requester_uid_name,
         };
         info!("{} created", &instance);
@@ -515,6 +528,7 @@ impl VmInstance {
         let death_reason = death_reason(&result, &failure_reason);
         let exit_signal = exit_signal(&result);
 
+        self.stop_host_vsock_tcp_bridges();
         self.callbacks.callback_on_died(self.cid, death_reason);
 
         let vm_metric = self.vm_metric.lock().unwrap();
@@ -623,6 +637,7 @@ impl VmInstance {
 
     /// Kills the crosvm instance, if it is running.
     pub fn kill(&self) -> Result<(), Error> {
+        self.stop_host_vsock_tcp_bridges();
         let monitor_vm_exit_thread = {
             let vm_state = &mut *self.vm_state.lock().unwrap();
             if let VmState::Running { child, monitor_vm_exit_thread } = vm_state {
@@ -732,6 +747,71 @@ impl VmInstance {
         ) {
             Ok(VmResponse::Ok) => Ok(()),
             e => bail!("Failed to resume: {e:?}"),
+        }
+    }
+
+    pub fn start_host_vsock_tcp_bridge(
+        &self,
+        host_port: u16,
+        guest_port: u32,
+    ) -> Result<(), Error> {
+        {
+            let bridges = self.host_vsock_tcp_bridges.lock().unwrap();
+            if let Some(active) = bridges.get(&host_port) {
+                if active.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+            }
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", host_port))
+            .with_context(|| format!("failed to bind localhost:{host_port}"))?;
+        listener
+            .set_nonblocking(true)
+            .with_context(|| format!("failed to set nonblocking localhost:{host_port}"))?;
+
+        let running = Arc::new(AtomicBool::new(true));
+        self.host_vsock_tcp_bridges.lock().unwrap().insert(host_port, Arc::clone(&running));
+
+        let cid = self.cid;
+        thread::Builder::new()
+            .name(format!("virtmgr-host-vsock-bridge-{host_port}"))
+            .spawn(move || {
+                while running.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((tcp, _remote)) => {
+                            thread::spawn(move || {
+                                if let Err(err) =
+                                    bridge_tcp_client_to_guest_vsock(cid, guest_port, tcp)
+                                {
+                                    error!(
+                                        "Host bridge failed for cid={} host_port={} guest_port={}: {:#}",
+                                        cid, host_port, guest_port, err
+                                    );
+                                }
+                            });
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                        Err(err) => {
+                            error!(
+                                "Host bridge listener error for cid={} host_port={} guest_port={}: {}",
+                                cid, host_port, guest_port, err
+                            );
+                            break;
+                        }
+                    }
+                }
+            })
+            .with_context(|| format!("failed to spawn host bridge thread for localhost:{host_port}"))?;
+        Ok(())
+    }
+
+    fn stop_host_vsock_tcp_bridges(&self) {
+        let bridges = mem::take(&mut *self.host_vsock_tcp_bridges.lock().unwrap());
+        for active in bridges.into_values() {
+            active.store(false, Ordering::Release);
         }
     }
 }
@@ -893,6 +973,10 @@ fn vfio_argument_for_platform_device(device: &VfioDevice) -> Result<String, Erro
     }
 }
 
+fn crosvm_binary() -> OsString {
+    std::env::var_os(VIRTMGR_CROSVM_PATH).unwrap_or_else(|| OsString::from(CROSVM_PATH))
+}
+
 /// Starts an instance of `crosvm` to manage a new VM.
 fn run_vm(
     config: CrosvmConfig,
@@ -901,7 +985,7 @@ fn run_vm(
 ) -> Result<SharedChild, Error> {
     validate_config(&config)?;
 
-    let mut command = Command::new(CROSVM_PATH);
+    let mut command = Command::new(crosvm_binary());
     // TODO(qwandor): Remove --disable-sandbox.
     command
         .arg("--extended-status")
@@ -1286,6 +1370,11 @@ fn create_pipe() -> Result<(File, File), Error> {
 /// argument. See `UnixSeqpacketListener::bind` in crosvm's code for reference.
 fn create_crosvm_control_listener(crosvm_control_socket_path: &Path) -> Result<OwnedFd> {
     use nix::sys::socket;
+    if crosvm_control_socket_path.exists() {
+        std::fs::remove_file(crosvm_control_socket_path).with_context(|| {
+            format!("failed to remove stale socket {:?}", crosvm_control_socket_path)
+        })?;
+    }
     let fd = socket::socket(
         socket::AddressFamily::Unix,
         socket::SockType::SeqPacket,
@@ -1299,4 +1388,40 @@ fn create_crosvm_control_listener(crosvm_control_socket_path: &Path) -> Result<O
     // because of a `nix` bug.
     socket::listen(&fd, socket::Backlog::new(127).unwrap()).context("listen failed")?;
     Ok(fd)
+}
+
+fn bridge_tcp_client_to_guest_vsock(
+    cid: Cid,
+    guest_port: u32,
+    tcp: TcpStream,
+) -> Result<(), Error> {
+    let stream = crate::vsock_transport::connect(cid, guest_port).with_context(|| {
+        format!("failed to connect guest vsock for cid={cid} port={guest_port}")
+    })?;
+    let mut guest_reader = unsafe { File::from_raw_fd(stream.into_raw_fd()) };
+    let mut guest_writer =
+        guest_reader.try_clone().context("failed to clone guest vsock stream")?;
+    let mut tcp_reader = tcp.try_clone().context("failed to clone TCP stream")?;
+    let mut tcp_writer = tcp;
+
+    let host_to_guest = thread::spawn(move || -> io::Result<u64> {
+        let copied = io::copy(&mut tcp_reader, &mut guest_writer)?;
+        guest_writer.flush()?;
+        Ok(copied)
+    });
+    let guest_to_host = thread::spawn(move || -> io::Result<u64> {
+        let copied = io::copy(&mut guest_reader, &mut tcp_writer)?;
+        let _ = tcp_writer.shutdown(Shutdown::Write);
+        Ok(copied)
+    });
+
+    host_to_guest
+        .join()
+        .map_err(|_| anyhow!("host_to_guest bridge thread panicked"))?
+        .context("tcp->guest copy failed")?;
+    guest_to_host
+        .join()
+        .map_err(|_| anyhow!("guest_to_host bridge thread panicked"))?
+        .context("guest->tcp copy failed")?;
+    Ok(())
 }

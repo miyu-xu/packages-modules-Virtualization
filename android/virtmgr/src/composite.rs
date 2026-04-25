@@ -19,10 +19,10 @@ use crate::os_compat::AsRawFd;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::Partition::Partition;
 use anyhow::{bail, Context, Error};
 use disk::{create_composite_disk, ImagePartitionType, PartitionInfo};
-use std::fs::{File, OpenOptions};
-use std::io::ErrorKind;
 #[cfg(windows)]
 use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 
 fn read_exact_at_compat(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -46,11 +46,11 @@ fn read_exact_at_compat(file: &File, buf: &mut [u8], offset: u64) -> std::io::Re
         Ok(())
     }
 }
-use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStringExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
 use zerocopy::AsBytes;
@@ -159,7 +159,8 @@ fn path_for_file(file: &File) -> Result<PathBuf, Error> {
     {
         let h = file.as_raw_handle();
         let mut buf = vec![0u16; 32768];
-        let len = unsafe { GetFinalPathNameByHandleW(h as _, buf.as_mut_ptr(), buf.len() as u32, 0) };
+        let len =
+            unsafe { GetFinalPathNameByHandleW(h as _, buf.as_mut_ptr(), buf.len() as u32, 0) };
         if len == 0 {
             bail!(
                 "GetFinalPathNameByHandleW failed for composite input: {}",

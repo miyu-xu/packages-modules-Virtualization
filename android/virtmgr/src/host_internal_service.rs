@@ -119,7 +119,7 @@ impl IVirtualizationServiceInternal for HostVirtualizationServiceInternal {
         _arg_requesterUid: i32,
         _arg_testMode: bool,
     ) -> binder::Result<Vec<Certificate>> {
-        Self::unsupported("Remote attestation is not implemented for the Windows host runtime")
+        Self::unsupported("Remote attestation is not implemented for the desktop host runtime")
     }
 
     fn r#enableTestAttestation(&self) -> binder::Result<()> {
@@ -138,11 +138,11 @@ impl IVirtualizationServiceInternal for HostVirtualizationServiceInternal {
         &self,
         _arg_devices: &[String],
     ) -> binder::Result<Vec<Strong<dyn IBoundDevice>>> {
-        Self::unsupported("VFIO device assignment is not implemented for the Windows host runtime")
+        Self::unsupported("VFIO device assignment is not implemented for the desktop host runtime")
     }
 
     fn r#getDtboFile(&self) -> binder::Result<ParcelFileDescriptor> {
-        Self::unsupported("DTBO access is not implemented for the Windows host runtime")
+        Self::unsupported("DTBO access is not implemented for the desktop host runtime")
     }
 
     fn r#allocateInstanceId(&self) -> binder::Result<[u8; 64]> {
@@ -165,7 +165,7 @@ impl IVirtualizationServiceInternal for HostVirtualizationServiceInternal {
 
     fn r#setDisplayService(&self, _arg_ibinder: &SpIBinder) -> binder::Result<()> {
         Self::unsupported(
-            "Display service bridging is not implemented for the Windows host runtime",
+            "Display service bridging is not implemented for the desktop host runtime",
         )
     }
 
@@ -175,7 +175,7 @@ impl IVirtualizationServiceInternal for HostVirtualizationServiceInternal {
 
     fn r#waitDisplayService(&self) -> binder::Result<SpIBinder> {
         Self::unsupported(
-            "Display service bridging is not implemented for the Windows host runtime",
+            "Display service bridging is not implemented for the desktop host runtime",
         )
     }
 
@@ -183,7 +183,7 @@ impl IVirtualizationServiceInternal for HostVirtualizationServiceInternal {
         &self,
         _arg_ifaceNameSuffix: &str,
     ) -> binder::Result<ParcelFileDescriptor> {
-        Self::unsupported("Tap networking is not implemented for the Windows host runtime")
+        Self::unsupported("Tap networking is not implemented for the desktop host runtime")
     }
 
     fn r#deleteTapInterface(&self, _arg_tapFd: &ParcelFileDescriptor) -> binder::Result<()> {

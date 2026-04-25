@@ -20,7 +20,7 @@ mod composite;
 mod crosvm;
 mod debug_config;
 mod dt_overlay;
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 mod host_internal_service;
 mod non_windows_main;
 mod os_compat;

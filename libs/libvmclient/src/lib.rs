@@ -76,6 +76,8 @@ use std::os::fd::AsFd;
 use std::os::fd::FromRawFd;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 const EARLY_VIRTMGR_PATH: &str = "/apex/com.android.virt/bin/early_virtmgr";
 const VIRTMGR_PATH: &str = "/apex/com.android.virt/bin/virtmgr";
@@ -337,7 +339,7 @@ fn file_from_connect_vsock_pfd(pfd: ParcelFileDescriptor) -> File {
 /// Running virtmgr connection: Unix domain bootstrap fd (Unix) or RPC vsock port (Windows).
 pub struct VirtualizationService {
     #[cfg(unix)]
-    client_fd: OwnedFd,
+    connection: spawn_unix::UnixConnection,
     #[cfg(windows)]
     rpc_port: u32,
     #[cfg(windows)]
@@ -369,7 +371,12 @@ pub unsafe extern "C" fn get_virtualization_service(
         Ok(vs) => {
             #[cfg(unix)]
             {
-                vs.client_fd.into_raw_fd()
+                match vs.connection {
+                    spawn_unix::UnixConnection::Bootstrap(client_fd) => client_fd.into_raw_fd(),
+                    spawn_unix::UnixConnection::UnixDomain(path) => {
+                        UnixStream::connect(path).map(|stream| stream.into_raw_fd()).unwrap_or(-1)
+                    }
+                }
             }
             #[cfg(windows)]
             {
@@ -427,8 +434,8 @@ impl VirtualizationService {
     fn new_with_path(virtmgr_path: &std::ffi::OsStr) -> Result<VirtualizationService, io::Error> {
         #[cfg(unix)]
         {
-            let client_fd = spawn_unix::spawn_virtmgr(virtmgr_path)?;
-            Ok(VirtualizationService { client_fd })
+            let spawned = spawn_unix::spawn_virtmgr(virtmgr_path)?;
+            Ok(VirtualizationService { connection: spawned.connection })
         }
         #[cfg(windows)]
         {
@@ -448,9 +455,14 @@ impl VirtualizationService {
         session.set_max_incoming_threads(VIRTMGR_THREADS);
         #[cfg(unix)]
         {
-            session
-                .setup_unix_domain_bootstrap_client(self.client_fd.as_fd())
-                .map_err(|_| io::Error::from(io::ErrorKind::ConnectionRefused))
+            match &self.connection {
+                spawn_unix::UnixConnection::Bootstrap(client_fd) => session
+                    .setup_unix_domain_bootstrap_client(client_fd.as_fd())
+                    .map_err(|_| io::Error::from(io::ErrorKind::ConnectionRefused)),
+                spawn_unix::UnixConnection::UnixDomain(path) => session
+                    .setup_unix_domain_client(path.to_string_lossy().as_ref())
+                    .map_err(|_| io::Error::from(io::ErrorKind::ConnectionRefused)),
+            }
         }
         #[cfg(windows)]
         {
@@ -460,7 +472,7 @@ impl VirtualizationService {
                 match session.setup_vsock_client(HOST_RPC_CID, self.rpc_port) {
                     Ok(service) => {
                         eprintln!("vmclient: after setup_vsock_client");
-                        break Ok(service)
+                        break Ok(service);
                     }
                     Err(_) if std::time::Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(100));
@@ -584,8 +596,12 @@ impl VmInstance {
     /// why it died.
     pub fn wait_for_death(&self) -> DeathReason {
         debug_trace(format!("vmclient: wait_for_death enter cid={}", self.cid));
-        let reason =
-            self.state.wait_while(|state| state.death_reason.is_none()).unwrap().death_reason.unwrap();
+        let reason = self
+            .state
+            .wait_while(|state| state.death_reason.is_none())
+            .unwrap()
+            .death_reason
+            .unwrap();
         debug_trace(format!("vmclient: wait_for_death exit cid={} reason={:?}", self.cid, reason));
         reason
     }
@@ -639,14 +655,14 @@ impl VmInstance {
         })
     }
 
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     pub fn start_tcp_vsock_bridge(&self, listen_port: u16, guest_port: u32) -> io::Result<()> {
         self.vm
             .startHostVsockTcpBridge(listen_port as i32, guest_port as i32)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
     }
 
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     pub fn set_host_console_name(&self, host_console_name: &str) -> io::Result<()> {
         self.vm
             .setHostConsoleName(host_console_name)

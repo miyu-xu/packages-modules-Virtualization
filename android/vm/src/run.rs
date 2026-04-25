@@ -32,25 +32,102 @@ use binder::ParcelFileDescriptor;
 use glob::glob;
 use microdroid_payload_config::VmPayloadConfig;
 use rand::{distributions::Alphanumeric, Rng};
+#[cfg(all(unix, not(target_os = "android")))]
+use std::ffi::CStr;
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, FromRawFd};
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 use std::time::Duration;
 use vmclient::{ErrorCode, VmInstance};
 use vmconfig::{get_debug_level, open_parcel_file, resolve_host_path, VmConfig};
 use zip::ZipArchive;
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 const WINDOWS_FILE_CONSOLE_PREFIX: &str = "win-file-console|";
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 fn persistent_service_mode_enabled() -> bool {
     std::env::var_os("VIRTMGR_SERVICE_DIR").is_some()
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+struct HostConsolePty {
+    console_out: File,
+    console_in: File,
+    host_console_name: String,
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn create_host_console_pty() -> Result<HostConsolePty, Error> {
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut name = [0 as libc::c_char; 128];
+    let rc = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            name.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error()).context("Failed to allocate PTY for host console");
+    }
+
+    let host_console_name = unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned();
+    let console_out = unsafe { File::from_raw_fd(master_fd) };
+    let console_in =
+        console_out.try_clone().context("Failed to duplicate PTY master for console input")?;
+    drop(unsafe { File::from_raw_fd(slave_fd) });
+
+    Ok(HostConsolePty { console_out, console_in, host_console_name })
+}
+
+fn prepare_console_handles(
+    console_out_path: Option<&Path>,
+    console_in_path: Option<&Path>,
+) -> Result<(Option<File>, Option<File>, Option<String>), Error> {
+    #[cfg(all(unix, not(target_os = "android")))]
+    if console_out_path.is_none() && console_in_path.is_none() && persistent_service_mode_enabled()
+    {
+        let console = create_host_console_pty()?;
+        return Ok((
+            Some(console.console_out),
+            Some(console.console_in),
+            Some(console.host_console_name),
+        ));
+    }
+
+    let console_out = if let Some(console_out_path) = console_out_path {
+        Some(File::create(console_out_path).with_context(|| {
+            format!("Failed to open console output file {:?}", console_out_path)
+        })?)
+    } else {
+        Some(duplicate_stdio_out()?)
+    };
+    let console_in =
+        if let Some(console_in_path) = console_in_path {
+            Some(File::open(console_in_path).with_context(|| {
+                format!("Failed to open console input file {:?}", console_in_path)
+            })?)
+        } else {
+            Some(duplicate_stdio_in()?)
+        };
+
+    #[cfg(windows)]
+    let host_console_name = console_out_path.map(|console_out_path| {
+        encode_windows_host_console_name(console_out_path, console_in_path)
+    });
+    #[cfg(not(windows))]
+    let host_console_name = None;
+
+    Ok((console_out, console_in, host_console_name))
 }
 
 /// Run a VM from the given APK, idsig, and config.
@@ -112,7 +189,8 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
             id
         } else {
             println!("vm: before service.allocateInstanceId");
-            let id = service.as_ref().allocateInstanceId().context("Failed to allocate instance_id")?;
+            let id =
+                service.as_ref().allocateInstanceId().context("Failed to allocate instance_id")?;
             println!("vm: after service.allocateInstanceId");
             let mut instance_id_file = File::create(id_file)?;
             instance_id_file.write_all(&id)?;
@@ -231,9 +309,9 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
 
 fn find_empty_payload_apk_path() -> Result<PathBuf, Error> {
     const GLOB_PATTERN: &str = "/apex/com.android.virt/app/**/EmptyPayloadApp*.apk";
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     let pattern = resolve_host_path(Path::new(GLOB_PATTERN)).to_string_lossy().into_owned();
-    #[cfg(not(windows))]
+    #[cfg(target_os = "android")]
     let pattern = GLOB_PATTERN.to_owned();
     let mut entries: Vec<PathBuf> =
         glob(&pattern).context("failed to glob")?.filter_map(|e| e.ok()).collect();
@@ -249,7 +327,10 @@ fn find_empty_payload_apk_path() -> Result<PathBuf, Error> {
 fn create_work_dir() -> Result<PathBuf, Error> {
     let s: String =
         rand::thread_rng().sample_iter(&Alphanumeric).take(17).map(char::from).collect();
+    #[cfg(target_os = "android")]
     let work_dir = PathBuf::from("/data/local/tmp/microdroid").join(s);
+    #[cfg(not(target_os = "android"))]
+    let work_dir = std::env::temp_dir().join("microdroid").join(s);
     println!("creating work dir {}", work_dir.display());
     fs::create_dir_all(&work_dir).context("failed to mkdir")?;
     Ok(work_dir)
@@ -337,21 +418,8 @@ fn run(
     log_path: Option<&Path>,
     adb_tcp_port: Option<u16>,
 ) -> Result<(), Error> {
-    let console_out = if let Some(console_out_path) = console_out_path {
-        Some(File::create(console_out_path).with_context(|| {
-            format!("Failed to open console output file {:?}", console_out_path)
-        })?)
-    } else {
-        Some(duplicate_stdio_out()?)
-    };
-    let console_in =
-        if let Some(console_in_path) = console_in_path {
-            Some(File::open(console_in_path).with_context(|| {
-                format!("Failed to open console input file {:?}", console_in_path)
-            })?)
-        } else {
-            Some(duplicate_stdio_in()?)
-        };
+    let (console_out, console_in, host_console_name) =
+        prepare_console_handles(console_out_path, console_in_path)?;
     let log = if let Some(log_path) = log_path {
         Some(
             File::create(log_path)
@@ -365,10 +433,8 @@ fn run(
     let vm = VmInstance::create(service, config, console_out, console_in, log, Some(callback))
         .context("Failed to create VM")?;
     println!("vm: after VmInstance::create");
-    #[cfg(windows)]
-    if let Some(console_out_path) = console_out_path {
-        let host_console_name =
-            encode_windows_host_console_name(console_out_path, console_in_path);
+    #[cfg(not(target_os = "android"))]
+    if let Some(host_console_name) = host_console_name {
         vm.set_host_console_name(&host_console_name)
             .context("Failed to register host console metadata for vm console")?;
     }
@@ -386,7 +452,7 @@ fn run(
         state_to_str(vm.state()?)
     );
 
-    #[cfg(windows)]
+    #[cfg(not(target_os = "android"))]
     {
         let should_detach_after_ready = persistent_service_mode_enabled();
         if should_detach_after_ready || adb_tcp_port.is_some() {
@@ -400,7 +466,7 @@ fn run(
             println!("ADB bridge listening on 127.0.0.1:{port} -> guest vsock:5555");
         }
         if should_detach_after_ready {
-            println!("Persistent Windows virtmgr mode: leaving VM running after READY.");
+            println!("Persistent host virtmgr mode: leaving VM running after READY.");
             return Ok(());
         }
     }
@@ -459,7 +525,7 @@ fn duplicate_stdio_in() -> io::Result<File> {
     File::open("CONIN$")
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "android"))]
 fn encode_windows_host_console_name(
     console_out_path: &Path,
     console_in_path: Option<&Path>,
@@ -468,9 +534,7 @@ fn encode_windows_host_console_name(
         "{}{}|{}",
         WINDOWS_FILE_CONSOLE_PREFIX,
         console_out_path.to_string_lossy(),
-        console_in_path
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        console_in_path.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()
     )
 }
 

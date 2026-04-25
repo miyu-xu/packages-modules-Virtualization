@@ -95,13 +95,12 @@ fn file_path_for_crosvm(file: &File) -> Result<PathBuf> {
         let mut console_mode = 0;
         if unsafe { GetConsoleMode(h as _, &mut console_mode) } != 0 {
             let mut pending_events = 0;
-            let console_path = if unsafe { GetNumberOfConsoleInputEvents(h as _, &mut pending_events) }
-                != 0
-            {
-                "CONIN$"
-            } else {
-                "CONOUT$"
-            };
+            let console_path =
+                if unsafe { GetNumberOfConsoleInputEvents(h as _, &mut pending_events) } != 0 {
+                    "CONIN$"
+                } else {
+                    "CONOUT$"
+                };
             return Ok(PathBuf::from(console_path));
         }
         bail!("GetFinalPathNameByHandleW failed: {}", std::io::Error::last_os_error());
@@ -477,7 +476,11 @@ impl VmInstance {
         if ret.is_ok() {
             info!("{} started", &self);
         }
-        debug_trace(format!("virtmgr: after VmInstance::start cid={} ok={}", self.cid, ret.is_ok()));
+        debug_trace(format!(
+            "virtmgr: after VmInstance::start cid={} ok={}",
+            self.cid,
+            ret.is_ok()
+        ));
         eprintln!("virtmgr: after VmInstance::start cid={} ok={}", self.cid, ret.is_ok());
         ret.with_context(|| format!("{} failed to start", &self))
     }
@@ -542,7 +545,10 @@ impl VmInstance {
         let exit_signal = exit_signal(&result);
 
         self.stop_host_vsock_tcp_bridges();
-        debug_trace(format!("virtmgr: monitor_vm_exit callback_on_died cid={} reason={:?}", self.cid, death_reason));
+        debug_trace(format!(
+            "virtmgr: monitor_vm_exit callback_on_died cid={} reason={:?}",
+            self.cid, death_reason
+        ));
         self.callbacks.callback_on_died(self.cid, death_reason);
 
         let vm_metric = self.vm_metric.lock().unwrap();
@@ -695,7 +701,11 @@ impl VmInstance {
         prepare_vsock_connection_path(&self.crosvm_control_socket_path, port)
     }
 
-    pub fn start_host_vsock_tcp_bridge(&self, host_port: u16, guest_port: u32) -> Result<(), Error> {
+    pub fn start_host_vsock_tcp_bridge(
+        &self,
+        host_port: u16,
+        guest_port: u32,
+    ) -> Result<(), Error> {
         {
             let bridges = self.host_vsock_tcp_bridges.lock().unwrap();
             if let Some(active) = bridges.get(&host_port) {
@@ -716,10 +726,7 @@ impl VmInstance {
             .with_context(|| format!("failed to set nonblocking localhost:{host_port}"))?;
 
         let running = Arc::new(AtomicBool::new(true));
-        self.host_vsock_tcp_bridges
-            .lock()
-            .unwrap()
-            .insert(host_port, Arc::clone(&running));
+        self.host_vsock_tcp_bridges.lock().unwrap().insert(host_port, Arc::clone(&running));
 
         let cid = self.cid;
         let control_socket = self.crosvm_control_socket_path.clone();
@@ -779,10 +786,8 @@ impl VmInstance {
 }
 
 fn prepare_vsock_connection_path(control_socket_path: &Path, port: u32) -> Result<(), Error> {
-    match vm_control::client::handle_request(
-        &VmRequest::ConnectVsock { port },
-        control_socket_path,
-    ) {
+    match vm_control::client::handle_request(&VmRequest::ConnectVsock { port }, control_socket_path)
+    {
         Ok(VmResponse::Ok) => Ok(()),
         Ok(VmResponse::Err(e)) => {
             bail!("Failed to prepare vsock connection: errno {}", e.errno())
@@ -798,8 +803,9 @@ fn bridge_tcp_client_to_guest_vsock(
     tcp: TcpStream,
 ) -> Result<(), Error> {
     prepare_vsock_connection_path(control_socket_path, guest_port)?;
-    let handle = crate::vsock_transport::connect(cid, guest_port)
-        .with_context(|| format!("failed to connect guest vsock pipe for cid={cid} port={guest_port}"))?;
+    let handle = crate::vsock_transport::connect(cid, guest_port).with_context(|| {
+        format!("failed to connect guest vsock pipe for cid={cid} port={guest_port}")
+    })?;
     let pipe_file = File::from(handle);
     let mut pipe_reader = pipe_file.try_clone().context("failed to clone guest vsock pipe")?;
     let mut pipe_writer = pipe_file;
@@ -817,12 +823,10 @@ fn bridge_tcp_client_to_guest_vsock(
         Ok(copied)
     });
 
-    let host_to_guest_result = host_to_guest
-        .join()
-        .map_err(|_| anyhow!("host_to_guest bridge thread panicked"))?;
-    let guest_to_host_result = guest_to_host
-        .join()
-        .map_err(|_| anyhow!("guest_to_host bridge thread panicked"))?;
+    let host_to_guest_result =
+        host_to_guest.join().map_err(|_| anyhow!("host_to_guest bridge thread panicked"))?;
+    let guest_to_host_result =
+        guest_to_host.join().map_err(|_| anyhow!("guest_to_host bridge thread panicked"))?;
 
     host_to_guest_result.context("tcp->guest copy failed")?;
     guest_to_host_result.context("guest->tcp copy failed")?;
@@ -1032,7 +1036,9 @@ fn run_vm(
     }
 
     for disk in config.disks {
-        if let Ok(path) = disk.image.try_clone().and_then(|f| file_path_for_crosvm(&f).map_err(io::Error::other)) {
+        if let Ok(path) =
+            disk.image.try_clone().and_then(|f| file_path_for_crosvm(&f).map_err(io::Error::other))
+        {
             debug_trace(format!(
                 "virtmgr: disk path cid={} path={} exists={}",
                 config.cid,
@@ -1056,12 +1062,10 @@ fn run_vm(
     if crosvm_stdio_capture_enabled() {
         let stdout_path = temporary_directory.join("crosvm-stdout.txt");
         let stderr_path = temporary_directory.join("crosvm-stderr.txt");
-        command.stdout(
-            OpenOptions::new().create(true).write(true).truncate(true).open(&stdout_path)?,
-        );
-        command.stderr(
-            OpenOptions::new().create(true).write(true).truncate(true).open(&stderr_path)?,
-        );
+        command
+            .stdout(OpenOptions::new().create(true).write(true).truncate(true).open(&stdout_path)?);
+        command
+            .stderr(OpenOptions::new().create(true).write(true).truncate(true).open(&stderr_path)?);
     }
 
     if let Some(dt_overlay) = config.device_tree_overlay.take() {
@@ -1143,7 +1147,11 @@ fn run_vm(
     debug_trace(format!("virtmgr: before SharedChild::spawn cid={}", config.cid));
     eprintln!("virtmgr: before SharedChild::spawn cid={}", config.cid);
     let result = SharedChild::spawn(&mut command)?;
-    debug_trace(format!("virtmgr: after SharedChild::spawn cid={} pid={}", config.cid, result.id()));
+    debug_trace(format!(
+        "virtmgr: after SharedChild::spawn cid={} pid={}",
+        config.cid,
+        result.id()
+    ));
     eprintln!("virtmgr: after SharedChild::spawn cid={} pid={}", config.cid, result.id());
     debug!("Spawned crosvm({}).", result.id());
     Ok((result, keepalive))
