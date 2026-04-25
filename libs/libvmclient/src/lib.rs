@@ -39,8 +39,9 @@ use log::warn;
 use rpcbinder::{FileDescriptorTransportMode, RpcSession};
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::io;
+#[cfg(windows)]
 use std::io::Read;
-use std::io::Write;
+use std::io::Write as _;
 #[cfg(windows)]
 use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(windows)]
@@ -75,7 +76,7 @@ use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::io::IntoRawFd;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
@@ -92,25 +93,20 @@ const VIRTMGR_THREADS: usize = 2;
 const VIRTMGR_THREADS: usize = 2;
 #[cfg(windows)]
 const HOST_RPC_CID: u32 = 1;
-#[cfg(windows)]
 const VMCLIENT_TRACE_FILE: &str = "VMCLIENT_TRACE_FILE";
 #[cfg(windows)]
 const STILL_ACTIVE_EXIT_CODE: u32 = 259;
 
-#[cfg(windows)]
 fn debug_trace(message: impl AsRef<str>) {
     let Ok(path) = std::env::var(VMCLIENT_TRACE_FILE) else {
         return;
     };
 
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        use std::io::Write;
         let _ = writeln!(file, "{}", message.as_ref());
     }
 }
 
-#[cfg(not(windows))]
-fn debug_trace(_message: impl AsRef<str>) {}
 
 #[cfg(windows)]
 fn ensure_winsock_init() -> io::Result<()> {

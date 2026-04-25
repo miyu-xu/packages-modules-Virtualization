@@ -11,7 +11,10 @@ fn main() {
     let sanitized = out_dir.join("metadata_sanitized.rs");
 
     println!("cargo:rerun-if-changed={}", proto.display());
+    let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc must be available");
     protobuf_codegen::Codegen::new()
+        .protoc()
+        .protoc_path(&protoc)
         .out_dir(&out_dir)
         .inputs([proto.as_path()])
         .includes([proto_root.as_path()])

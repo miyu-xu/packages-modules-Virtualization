@@ -52,6 +52,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 use vm_control::{BalloonControlCommand, VmRequest, VmResponse};
@@ -76,11 +77,11 @@ const SYSPROP_CUSTOM_PVMFW_PATH: &str = "hypervisor.pvmfw.path";
 const CONSOLE_HVC0: &str = "hvc0";
 const CONSOLE_TTYS0: &str = "ttyS0";
 
-static BOOT_HANGUP_TIMEOUT: std::sync::LazyLock<Duration> =
+static BOOT_HANGUP_TIMEOUT: once_cell::sync::Lazy<Duration> =
     // Windows host bringup is slower than the Unix AVF path because guest->host Binder RPC,
     // composite disk assembly, and the userspace virtio-vsock bridge all sit on compatibility
     // layers instead of native Android plumbing.
-    std::sync::LazyLock::new(|| Duration::from_secs(120));
+    once_cell::sync::Lazy::new(|| Duration::from_secs(120));
 
 fn crosvm_binary() -> OsString {
     std::env::var_os(VIRTMGR_CROSVM_PATH).unwrap_or_else(|| OsString::from("crosvm.exe"))
@@ -174,6 +175,7 @@ pub struct CrosvmConfig {
     pub bootloader: Option<File>,
     pub kernel: Option<File>,
     pub initrd: Option<File>,
+    pub android_fstab: Option<File>,
     pub disks: Vec<DiskFile>,
     pub params: Option<String>,
     pub protected: bool,
@@ -516,6 +518,7 @@ impl VmInstance {
         let mut vm_state = self.vm_state.lock().unwrap();
         *vm_state = VmState::Dead;
         drop(vm_state);
+        self.payload_state_updated.notify_all();
         info!("{} exited", &self);
 
         let mut failure_reason = String::new();
@@ -567,15 +570,33 @@ impl VmInstance {
 
     fn monitor_payload_hangup(&self, child: Arc<SharedChild>) {
         debug!("Starting to monitor hangup for Microdroid({})", child.id());
-        let (state, result) = self
-            .payload_state_updated
-            .wait_timeout_while(self.payload_state.lock().unwrap(), *BOOT_HANGUP_TIMEOUT, |s| {
-                *s < PayloadState::Started
-            })
-            .unwrap();
-        drop(state);
+        let deadline = Instant::now() + *BOOT_HANGUP_TIMEOUT;
+        loop {
+            {
+                let state = self.payload_state.lock().unwrap();
+                if *state >= PayloadState::Started {
+                    return;
+                }
+            }
+            if matches!(*self.vm_state.lock().unwrap(), VmState::Dead | VmState::Failed) {
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let timeout = deadline.saturating_duration_since(now);
+            let (state, wait_result) = self
+                .payload_state_updated
+                .wait_timeout(self.payload_state.lock().unwrap(), timeout)
+                .unwrap();
+            drop(state);
+            if wait_result.timed_out() {
+                break;
+            }
+        }
         let child_still_running = child.try_wait().ok() == Some(None);
-        if result.timed_out() && child_still_running {
+        if child_still_running {
             error!(
                 "Microdroid({}) failed to start payload within {} secs timeout. Shutting down.",
                 child.id(),
@@ -1029,6 +1050,10 @@ fn run_vm(
 
     if let Some(initrd) = config.initrd.take() {
         command.arg("--initrd").arg(add_path(initrd)?);
+    }
+
+    if let Some(android_fstab) = config.android_fstab.take() {
+        command.arg("--android-fstab").arg(add_path(android_fstab)?);
     }
 
     if let Some(params) = &config.params {

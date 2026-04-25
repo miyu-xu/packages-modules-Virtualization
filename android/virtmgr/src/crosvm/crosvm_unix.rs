@@ -23,27 +23,33 @@ use command_fds::CommandFdExt;
 use libc::{sysconf, _SC_CLK_TCK};
 use log::{debug, error, info};
 use semver::{Version, VersionReq};
-use nix::{fcntl::OFlag, unistd::pipe2, unistd::Uid, unistd::User};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use nix::unistd::{pipe, Uid, User};
+#[cfg(not(target_os = "macos"))]
+use nix::unistd::pipe2;
 use regex::{Captures, Regex};
 use rustutils::system_properties;
 use shared_child::SharedChild;
+use std::backtrace::Backtrace;
 use std::borrow::Cow;
 use std::cmp::max;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::fmt;
 use std::fs::{read_to_string, File};
 use std::io::{self, Read, Write};
 use std::mem;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::num::{NonZeroU16, NonZeroU32};
-use std::os::fd::FromRawFd;
+use std::os::fd::{FromRawFd, RawFd};
 use crate::os_compat::{AsRawFd, ExitStatusExt, IntoRawFd};
 use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, LazyLock};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Condvar, Mutex};
+use once_cell::sync::Lazy;
+use std::time::{Duration, Instant, SystemTime};
 use std::thread::{self, JoinHandle};
 use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::DeathReason::DeathReason;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
@@ -66,6 +72,7 @@ use vm_control::{BalloonControlCommand, VmRequest, VmResponse};
 
 const CROSVM_PATH: &str = "/apex/com.android.virt/bin/crosvm";
 const VIRTMGR_CROSVM_PATH: &str = "VIRTMGR_CROSVM_PATH";
+const VIRTMGR_CROSVM_DTB_PATH: &str = "VIRTMGR_CROSVM_DTB_PATH";
 
 /// Version of the platform that crosvm currently implements. The format follows SemVer. This
 /// should be updated when there is a platform change in the crosvm side. Having this value here is
@@ -96,10 +103,12 @@ const CONSOLE_TTYS0: &str = "ttyS0";
 
 /// If the VM doesn't move to the Started state within this amount time, a hang-up error is
 /// triggered.
-static BOOT_HANGUP_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+static BOOT_HANGUP_TIMEOUT: Lazy<Duration> = Lazy::new(|| {
     if nested_virt::is_nested_virtualization().unwrap() {
         // Nested virtualization is slow, so we need a longer timeout.
         Duration::from_secs(300)
+    } else if cfg!(target_os = "macos") {
+        Duration::from_secs(120)
     } else {
         Duration::from_secs(30)
     }
@@ -113,6 +122,7 @@ pub struct CrosvmConfig {
     pub bootloader: Option<File>,
     pub kernel: Option<File>,
     pub initrd: Option<File>,
+    pub android_fstab: Option<File>,
     pub disks: Vec<DiskFile>,
     pub params: Option<String>,
     pub protected: bool,
@@ -486,11 +496,14 @@ impl VmInstance {
         vfio_devices: Vec<VfioDevice>,
         tap: Option<File>,
     ) {
+        eprintln!("virtmgr: waiting for crosvm({}) to exit", child.id());
         let result = child.wait();
+        eprintln!("virtmgr: child.wait() returned for crosvm({})", child.id());
         match &result {
             Err(e) => error!("Error waiting for crosvm({}) instance to die: {}", child.id(), e),
             Ok(status) => {
                 info!("crosvm({}) exited with status {}", child.id(), status);
+                eprintln!("virtmgr: crosvm({}) exited with status {}", child.id(), status);
                 if let Some(exit_status_code) = status.code() {
                     if exit_status_code == CROSVM_WATCHDOG_REBOOT_STATUS {
                         info!("detected vcpu stall on crosvm");
@@ -503,6 +516,7 @@ impl VmInstance {
         *vm_state = VmState::Dead;
         // Ensure that the mutex is released before calling the callbacks.
         drop(vm_state);
+        self.payload_state_updated.notify_all();
         info!("{} exited", &self);
 
         // Read the pipe to see if any failure reason is written
@@ -560,15 +574,33 @@ impl VmInstance {
     /// the VM to prevent indefinite hangup and update the payload_state accordingly.
     fn monitor_payload_hangup(&self, child: Arc<SharedChild>) {
         debug!("Starting to monitor hangup for Microdroid({})", child.id());
-        let (state, result) = self
-            .payload_state_updated
-            .wait_timeout_while(self.payload_state.lock().unwrap(), *BOOT_HANGUP_TIMEOUT, |s| {
-                *s < PayloadState::Started
-            })
-            .unwrap();
-        drop(state); // we are not interested in state
+        let deadline = Instant::now() + *BOOT_HANGUP_TIMEOUT;
+        loop {
+            {
+                let state = self.payload_state.lock().unwrap();
+                if *state >= PayloadState::Started {
+                    return;
+                }
+            }
+            if matches!(*self.vm_state.lock().unwrap(), VmState::Dead | VmState::Failed) {
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let timeout = deadline.saturating_duration_since(now);
+            let (state, wait_result) = self
+                .payload_state_updated
+                .wait_timeout(self.payload_state.lock().unwrap(), timeout)
+                .unwrap();
+            drop(state);
+            if wait_result.timed_out() {
+                break;
+            }
+        }
         let child_still_running = child.try_wait().ok() == Some(None);
-        if result.timed_out() && child_still_running {
+        if child_still_running {
             error!(
                 "Microdroid({}) failed to start payload within {} secs timeout. Shutting down.",
                 child.id(),
@@ -637,6 +669,12 @@ impl VmInstance {
 
     /// Kills the crosvm instance, if it is running.
     pub fn kill(&self) -> Result<(), Error> {
+        eprintln!(
+            "virtmgr: kill() invoked cid={} payload_state={:?}\n{}",
+            self.cid,
+            self.payload_state(),
+            Backtrace::force_capture()
+        );
         self.stop_host_vsock_tcp_bridges();
         let monitor_vm_exit_thread = {
             let vm_state = &mut *self.vm_state.lock().unwrap();
@@ -998,6 +1036,10 @@ fn run_vm(
         .arg("--cid")
         .arg(config.cid.to_string());
 
+    if cfg!(target_os = "macos") {
+        command.arg("--async-executor").arg("epoll");
+    }
+
     if system_properties::read_bool("hypervisor.memory_reclaim.supported", false)?
         && !config.no_balloon
     {
@@ -1097,6 +1139,11 @@ fn run_vm(
     let failure_serial_path = add_preserved_fd(&mut preserved_fds, failure_pipe_write);
     let ramdump_arg = format_serial_out_arg(&mut preserved_fds, config.ramdump);
     let console_input_device = config.console_input_device.as_deref().unwrap_or(CONSOLE_HVC0);
+    let mirror_early_console_to_log = cfg!(target_os = "macos")
+        && config.params.as_deref().is_some_and(|params| params.contains("earlycon="))
+        && !log_arg.is_empty();
+    let console_serial_out_arg =
+        if mirror_early_console_to_log { &log_arg } else { &console_out_arg };
     match console_input_device {
         CONSOLE_HVC0 | CONSOLE_TTYS0 => {}
         _ => bail!("Unsupported serial device {console_input_device}"),
@@ -1109,7 +1156,7 @@ fn run_vm(
     // /dev/ttyS0
     command.arg(format!(
         "--serial={}{},hardware=serial,num=1",
-        &console_out_arg,
+        console_serial_out_arg,
         if console_input_device == CONSOLE_TTYS0 { &console_in_arg } else { "" }
     ));
     // /dev/ttyS1
@@ -1117,7 +1164,7 @@ fn run_vm(
     // /dev/hvc0
     command.arg(format!(
         "--serial={}{},hardware=virtio-console,num=1",
-        &console_out_arg,
+        console_serial_out_arg,
         if console_input_device == CONSOLE_HVC0 { &console_in_arg } else { "" }
     ));
     // /dev/hvc1
@@ -1131,6 +1178,10 @@ fn run_vm(
 
     if let Some(initrd) = config.initrd {
         command.arg("--initrd").arg(add_preserved_fd(&mut preserved_fds, initrd));
+    }
+
+    if let Some(android_fstab) = config.android_fstab {
+        command.arg("--android-fstab").arg(add_preserved_fd(&mut preserved_fds, android_fstab));
     }
 
     if let Some(params) = &config.params {
@@ -1150,9 +1201,25 @@ fn run_vm(
         command.arg(add_preserved_fd(&mut preserved_fds, kernel));
     }
 
-    let control_sock = create_crosvm_control_listener(crosvm_control_socket_path)
-        .context("failed to create control listener")?;
-    command.arg("--socket").arg(add_preserved_fd(&mut preserved_fds, control_sock));
+    if let Some(dtb_path) = std::env::var_os(VIRTMGR_CROSVM_DTB_PATH) {
+        command.arg("--dump-device-tree-blob").arg(dtb_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if crosvm_control_socket_path.exists() {
+            std::fs::remove_file(crosvm_control_socket_path).with_context(|| {
+                format!("failed to remove stale socket {:?}", crosvm_control_socket_path)
+            })?;
+        }
+        command.arg("--socket").arg(crosvm_control_socket_path);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let control_sock = create_crosvm_control_listener(crosvm_control_socket_path)
+            .context("failed to create control listener")?;
+        command.arg("--socket").arg(add_preserved_fd(&mut preserved_fds, control_sock));
+    }
 
     if let Some(dt_overlay) = config.device_tree_overlay {
         command.arg("--device-tree-overlay").arg(add_preserved_fd(&mut preserved_fds, dt_overlay));
@@ -1290,7 +1357,9 @@ fn run_vm(
 
     print_crosvm_args(&command);
 
+    eprintln!("virtmgr: before SharedChild::spawn cid={}", config.cid);
     let result = SharedChild::spawn(&mut command)?;
+    eprintln!("virtmgr: after SharedChild::spawn cid={} pid={}", config.cid, result.id());
     debug!("Spawned crosvm({}).", result.id());
     Ok(result)
 }
@@ -1316,11 +1385,11 @@ fn validate_config(config: &CrosvmConfig) -> Result<(), Error> {
     Ok(())
 }
 
-/// Print arguments of the crosvm command. In doing so, /proc/self/fd/XX is annotated with the
-/// actual file path if the FD is backed by a regular file. If not, the /proc path is printed
+/// Print arguments of the crosvm command. In doing so, the inherited FD path is annotated with the
+/// actual file path if the FD is backed by a regular file. If not, the inherited-FD path is printed
 /// unmodified.
 fn print_crosvm_args(command: &Command) {
-    let re = Regex::new(r"/proc/self/fd/[\d]+").unwrap();
+    let re = Regex::new(r"/(?:proc/self|dev)/fd/[\d]+").unwrap();
     info!(
         "Running crosvm with args: {:?}",
         command
@@ -1341,13 +1410,31 @@ fn print_crosvm_args(command: &Command) {
     );
 }
 
-/// Adds the file descriptor for `file` to `preserved_fds`, and returns a string of the form
-/// "/proc/self/fd/N" where N is the file descriptor.
+fn inherited_fd_path(raw_fd: RawFd) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let mut path_buf = [0u8; libc::PATH_MAX as usize];
+        let rc = unsafe { libc::fcntl(raw_fd, libc::F_GETPATH, path_buf.as_mut_ptr()) };
+        if rc != -1 {
+            if let Ok(path) = unsafe { CStr::from_ptr(path_buf.as_ptr().cast()) }.to_str() {
+                return path.to_owned();
+            }
+        }
+        format!("/dev/fd/{}", raw_fd)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!("/proc/self/fd/{}", raw_fd)
+    }
+}
+
+/// Adds the file descriptor for `file` to `preserved_fds`, and returns a path for the inherited
+/// file descriptor.
 fn add_preserved_fd<F: Into<OwnedFd>>(preserved_fds: &mut Vec<OwnedFd>, file: F) -> String {
     let fd = file.into();
     let raw_fd = fd.as_raw_fd();
     preserved_fds.push(fd);
-    format!("/proc/self/fd/{}", raw_fd)
+    inherited_fd_path(raw_fd)
 }
 
 /// Adds the file descriptor for `file` (if any) to `preserved_fds`, and returns the appropriate
@@ -1362,12 +1449,21 @@ fn format_serial_out_arg(preserved_fds: &mut Vec<OwnedFd>, file: Option<File>) -
 
 /// Creates a new pipe with the `O_CLOEXEC` flag set, and returns the read side and write side.
 fn create_pipe() -> Result<(File, File), Error> {
+    #[cfg(target_os = "macos")]
+    let (read_fd, write_fd) = {
+        let (read_fd, write_fd) = pipe()?;
+        fcntl(read_fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        fcntl(write_fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        (read_fd, write_fd)
+    };
+    #[cfg(not(target_os = "macos"))]
     let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC)?;
     Ok((read_fd.into(), write_fd.into()))
 }
 
 /// Creates and binds a unix seqpacket listening socket to be passed as crosvm's `--socket`
 /// argument. See `UnixSeqpacketListener::bind` in crosvm's code for reference.
+#[cfg(not(target_os = "macos"))]
 fn create_crosvm_control_listener(crosvm_control_socket_path: &Path) -> Result<OwnedFd> {
     use nix::sys::socket;
     if crosvm_control_socket_path.exists() {
@@ -1375,13 +1471,13 @@ fn create_crosvm_control_listener(crosvm_control_socket_path: &Path) -> Result<O
             format!("failed to remove stale socket {:?}", crosvm_control_socket_path)
         })?;
     }
-    let fd = socket::socket(
-        socket::AddressFamily::Unix,
-        socket::SockType::SeqPacket,
-        socket::SockFlag::empty(),
-        None,
-    )
-    .context("socket failed")?;
+    #[cfg(target_os = "macos")]
+    let sock_type = socket::SockType::Stream;
+    #[cfg(not(target_os = "macos"))]
+    let sock_type = socket::SockType::SeqPacket;
+    let fd =
+        socket::socket(socket::AddressFamily::Unix, sock_type, socket::SockFlag::empty(), None)
+            .context("socket failed")?;
     socket::bind(fd.as_raw_fd(), &socket::UnixAddr::new(crosvm_control_socket_path)?)
         .context("bind failed")?;
     // The exact backlog size isn't imporant. crosvm uses 128 internally. We use 127 here

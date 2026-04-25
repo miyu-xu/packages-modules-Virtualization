@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use binder::ParcelFileDescriptor;
 use serde::Deserialize;
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -58,8 +59,16 @@ struct PartitionJson {
 
 impl VmConfig {
     pub fn load(f: &File) -> Result<Self> {
-        let cfg: VmConfig =
-            serde_json::from_reader(f).context("Failed to parse VM config JSON into VmConfig")?;
+        let mut bytes = Vec::new();
+        let mut reader = f;
+        reader
+            .read_to_end(&mut bytes)
+            .context("Failed to read VM config JSON into memory")?;
+        while matches!(bytes.last(), Some(b'\0' | b' ' | b'\t' | b'\r' | b'\n')) {
+            bytes.pop();
+        }
+        let cfg: VmConfig = serde_json::from_slice(&bytes)
+            .context("Failed to parse VM config JSON into VmConfig")?;
         Ok(cfg)
     }
 

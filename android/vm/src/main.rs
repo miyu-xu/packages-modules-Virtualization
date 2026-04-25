@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 const WINDOWS_FILE_CONSOLE_PREFIX: &str = "win-file-console|";
 
 #[cfg(all(unix, not(target_os = "android")))]
-fn attach_unix_console(host_console_name: &str) -> Result<(), Error> {
+fn attach_unix_console(host_console_name: &str, forward_stdin: bool) -> Result<(), Error> {
     let console = OpenOptions::new()
         .read(true)
         .write(true)
@@ -62,18 +62,22 @@ fn attach_unix_console(host_console_name: &str) -> Result<(), Error> {
     let mut console_reader = console
         .try_clone()
         .with_context(|| format!("Failed to clone console tty {host_console_name}"))?;
-    let input_thread = thread::spawn(move || -> io::Result<()> {
-        let mut stdin = io::stdin().lock();
-        let mut console_writer = console;
-        let _ = io::copy(&mut stdin, &mut console_writer)?;
-        Ok(())
+    let input_thread = forward_stdin.then(|| {
+        thread::spawn(move || -> io::Result<()> {
+            let mut stdin = io::stdin().lock();
+            let mut console_writer = console;
+            let _ = io::copy(&mut stdin, &mut console_writer)?;
+            Ok(())
+        })
     });
 
     let mut stdout = io::stdout().lock();
     io::copy(&mut console_reader, &mut stdout)
         .with_context(|| format!("Failed to read console tty {host_console_name}"))?;
     stdout.flush().context("Failed to flush console output")?;
-    let _ = input_thread.join();
+    if let Some(input_thread) = input_thread {
+        let _ = input_thread.join();
+    }
     Ok(())
 }
 
@@ -167,20 +171,13 @@ pub struct DebugConfig {
     adb_tcp_port: Option<NonZeroU16>,
 
     /// Whether to enable earlycon. Only supported for debuggable Linux-based VMs.
-    #[cfg(debuggable_vms_improvements)]
     #[arg(long)]
     enable_earlycon: bool,
 }
 
 impl DebugConfig {
     fn enable_earlycon(&self) -> bool {
-        cfg_if::cfg_if! {
-            if #[cfg(debuggable_vms_improvements)] {
-                self.enable_earlycon
-            } else {
-                false
-            }
-        }
+        self.enable_earlycon
     }
 
     fn adb_tcp_port(&self) -> Option<u16> {
@@ -540,7 +537,7 @@ fn command_info() -> Result<(), Error> {
         println!("Hypervisor version not set.");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use std::path::Path;
         if Path::new("/dev/kvm").exists() {
@@ -560,6 +557,13 @@ fn command_info() -> Result<(), Error> {
         } else {
             println!("VFIO-platform is not supported.");
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        println!(
+            "Hypervisor.framework (HVF): expected host hypervisor backend on macOS Apple Silicon."
+        );
+        println!("Linux device nodes (/dev/kvm, /dev/vfio/vfio, VFIO-platform sysfs): not applicable on macOS.");
     }
     #[cfg(windows)]
     {
@@ -751,9 +755,7 @@ fn command_console(
     _timeout_secs: Option<u64>,
     _read_only: bool,
 ) -> Result<(), Error> {
-    if !io::stdin().is_terminal() {
-        bail!("Stdin must be a terminal (tty).");
-    }
+    let forward_stdin = io::stdin().is_terminal();
     let service = get_service()?;
     let mut vms = service.as_ref().debugListVms().context("Failed to get list of VMs")?;
     if let Some(cid) = cid {
@@ -774,7 +776,10 @@ fn command_console(
         vm_info.hostConsoleName.context("Failed to get host console metadata for the VM")?;
     eprintln!("Connecting to host VM console for CID {}", vm_info.cid);
     eprintln!("Console tty   : {}", host_console_name);
-    attach_unix_console(&host_console_name)
+    if !forward_stdin {
+        eprintln!("Local stdin is not a tty; attaching in output-only mode.");
+    }
+    attach_unix_console(&host_console_name, forward_stdin)
 }
 
 #[cfg(test)]

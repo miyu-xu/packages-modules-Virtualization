@@ -72,8 +72,8 @@ fn create_host_console_pty() -> Result<HostConsolePty, Error> {
             &mut master_fd,
             &mut slave_fd,
             name.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     if rc == -1 {
@@ -271,8 +271,14 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
             custom_config
                 .extraKernelCmdlineParams
                 .push(String::from("earlycon=uart8250,mmio,0x3f8"));
+            if cfg!(target_os = "macos") {
+                custom_config.extraKernelCmdlineParams.push(String::from("console=ttyS0"));
+            }
         } else if cfg!(target_arch = "x86_64") {
             custom_config.extraKernelCmdlineParams.push(String::from("earlycon=uart8250,io,0x3f8"));
+            if cfg!(target_os = "macos") {
+                custom_config.extraKernelCmdlineParams.push(String::from("console=ttyS0"));
+            }
         } else {
             bail!("unexpected architecture!");
         }

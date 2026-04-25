@@ -19,7 +19,9 @@
 use anyhow::{Context, Result};
 use log::{debug, warn};
 use minijail::Minijail;
-use nix::fcntl::OFlag;
+use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use nix::unistd::pipe;
+#[cfg(not(target_os = "macos"))]
 use nix::unistd::pipe2;
 use std::fs::File;
 use std::io::Read;
@@ -106,6 +108,14 @@ impl Drop for FdServer {
 }
 
 fn create_pipe() -> Result<(File, File)> {
+    #[cfg(target_os = "macos")]
+    let (read_fd, write_fd) = {
+        let (read_fd, write_fd) = pipe()?;
+        fcntl(read_fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        fcntl(write_fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        (read_fd, write_fd)
+    };
+    #[cfg(not(target_os = "macos"))]
     let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC)?;
     Ok((read_fd.into(), write_fd.into()))
 }

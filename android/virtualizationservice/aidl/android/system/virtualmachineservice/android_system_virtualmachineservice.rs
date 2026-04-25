@@ -458,6 +458,32 @@ pub mod aidl {
                 }
                 Ok(())
               }
+              7 => {
+                _aidl_reply.write(&binder::Status::from(binder::StatusCode::OK))?;
+                Ok(())
+              }
+              8 => {
+                _aidl_reply.write(&binder::Status::from(binder::StatusCode::OK))?;
+                let _aidl_return: Option<binder::SpIBinder> = None;
+                _aidl_reply.write(&_aidl_return)?;
+                Ok(())
+              }
+              9 => {
+                let _arg_guestAgent: Option<binder::SpIBinder> = _aidl_data.read()?;
+                let _ = _arg_guestAgent;
+                _aidl_reply.write(&binder::Status::from(binder::StatusCode::OK))?;
+                Ok(())
+              }
+              10 => {
+                _aidl_reply.write(&binder::Status::from(binder::StatusCode::OK))?;
+                let _aidl_return: Option<binder::SpIBinder> = None;
+                _aidl_reply.write(&_aidl_return)?;
+                Ok(())
+              }
+              11 => {
+                _aidl_reply.write(&binder::Status::from(binder::StatusCode::OK))?;
+                Ok(())
+              }
               _ => Err(binder::StatusCode::UNKNOWN_TRANSACTION)
             }
           }

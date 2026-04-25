@@ -1,6 +1,6 @@
 // Entry point implementation (runs on all targets including Windows MinGW).
 
-use crate::aidl::{GLOBAL_SERVICE, VirtualizationService};
+use crate::aidl::{GLOBAL_SERVICE, VirtualizationService, debug_trace};
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::IVirtualizationService::BnVirtualizationService;
 use anyhow::{bail, Result};
 use binder::{BinderFeatures, ProcessState};
@@ -61,8 +61,10 @@ fn check_vm_support() -> Result<()> {
 }
 
 pub fn run() {
+    debug_trace("virtmgr: run start");
     unsafe { rustutils::inherited_fd::init_once() }
         .expect("Failed to take ownership of inherited FDs");
+    debug_trace("virtmgr: inherited fd init complete");
 
     android_logger::init_once(
         android_logger::Config::default()
@@ -70,13 +72,17 @@ pub fn run() {
             .with_max_level(LevelFilter::Info)
             .with_log_buffer(android_logger::LogId::System),
     );
+    debug_trace("virtmgr: android_logger init complete");
 
+    debug_trace("virtmgr: checking VM support");
     check_vm_support().unwrap();
+    debug_trace("virtmgr: VM support confirmed");
 
     #[cfg(windows)]
     ensure_winsock_init();
 
     let args = Args::parse();
+    debug_trace("virtmgr: args parsed");
     #[cfg(unix)]
     let ready_fd = take_fd_ownership(args.ready_fd).expect("Failed to take ownership of ready_fd");
     #[cfg(unix)]
@@ -97,17 +103,24 @@ pub fn run() {
         }
         _ => panic!("Exactly one of --rpc-server-fd or --rpc-server-path must be provided"),
     };
+    #[cfg(unix)]
+    debug_trace("virtmgr: rpc server transport prepared");
 
     #[cfg(not(windows))]
     ProcessState::start_thread_pool();
+    debug_trace("virtmgr: binder thread pool started");
 
     #[cfg(unix)]
     {
         if cfg!(early) {
-            let pid = i32::from(crate::get_this_pid());
             let lim = libc::rlimit { rlim_cur: libc::RLIM_INFINITY, rlim_max: libc::RLIM_INFINITY };
-            let ret =
-                unsafe { libc::prlimit(pid, libc::RLIMIT_MEMLOCK, &lim, std::ptr::null_mut()) };
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            let ret = {
+                let pid = i32::from(crate::get_this_pid());
+                unsafe { libc::prlimit(pid, libc::RLIMIT_MEMLOCK, &lim, std::ptr::null_mut()) }
+            };
+            #[cfg(target_os = "macos")]
+            let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim) };
             if ret == -1 {
                 panic!("rlimit error: {}", std::io::Error::last_os_error());
             } else if ret != 0 {
@@ -125,6 +138,7 @@ pub fn run() {
     }
 
     let service = VirtualizationService::init();
+    debug_trace("virtmgr: VirtualizationService initialized");
     let service =
         BnVirtualizationService::new_binder(service, BinderFeatures::default()).as_binder();
     #[cfg(unix)]
@@ -139,14 +153,17 @@ pub fn run() {
     let server = RpcServer::new_vsock(service, HOST_RPC_CID, args.rpc_port as u32)
         .expect("Failed to start RpcServer");
     server.set_supported_file_descriptor_transport_modes(&[FileDescriptorTransportMode::Unix]);
+    debug_trace("virtmgr: RpcServer created");
 
     info!("Started VirtualizationService RpcServer. Ready to accept connections");
 
     #[cfg(unix)]
     {
         let ready_fd = unsafe { BorrowedFd::borrow_raw(ready_fd) };
+        debug_trace("virtmgr: writing ready byte");
         write(ready_fd, "o".as_bytes())
             .expect("Failed to write a single character through ready_fd");
+        debug_trace("virtmgr: ready byte written");
     }
     server.join();
     info!("Shutting down VirtualizationService RpcServer");

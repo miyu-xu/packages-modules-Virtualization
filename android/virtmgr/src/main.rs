@@ -33,7 +33,7 @@ use crate::os_compat::pid_t;
 #[cfg(unix)]
 use nix::unistd::{Pid, Uid};
 #[cfg(unix)]
-use std::sync::LazyLock;
+use once_cell::sync::Lazy;
 
 #[cfg(windows)]
 fn getpid() -> pid_t {
@@ -41,11 +41,11 @@ fn getpid() -> pid_t {
 }
 
 #[cfg(unix)]
-static PID_CURRENT: LazyLock<Pid> = LazyLock::new(Pid::this);
+static PID_CURRENT: Lazy<Pid> = Lazy::new(Pid::this);
 #[cfg(unix)]
-static PID_PARENT: LazyLock<Pid> = LazyLock::new(Pid::parent);
+static PID_PARENT: Lazy<Pid> = Lazy::new(Pid::parent);
 #[cfg(unix)]
-static UID_CURRENT: LazyLock<Uid> = LazyLock::new(Uid::current);
+static UID_CURRENT: Lazy<Uid> = Lazy::new(Uid::current);
 
 pub fn get_this_pid() -> pid_t {
     #[cfg(unix)]

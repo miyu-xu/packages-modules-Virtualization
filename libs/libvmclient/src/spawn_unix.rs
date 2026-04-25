@@ -6,17 +6,22 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, RawFd};
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::debug_trace;
 use command_fds::CommandFdExt;
 use nix::errno::Errno;
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+#[cfg(not(target_os = "macos"))]
 use nix::fcntl::OFlag;
 use nix::sys::signal;
 use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
-use nix::unistd::{pipe2, Pid};
+use nix::unistd::{pipe, Pid};
+#[cfg(not(target_os = "macos"))]
+use nix::unistd::pipe2;
 use shared_child::SharedChild;
 
 const VIRTMGR_SERVICE_DIR_ENV: &str = "VIRTMGR_SERVICE_DIR";
@@ -33,12 +38,39 @@ pub struct SpawnedVirtmgr {
     pub connection: UnixConnection,
 }
 
+fn set_cloexec<F: AsFd>(fd: &F) -> io::Result<()> {
+    fcntl(fd.as_fd().as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+        .map_err(io::Error::from)?;
+    Ok(())
+}
+
 pub fn posix_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    Ok(pipe2(OFlag::O_CLOEXEC)?)
+    #[cfg(target_os = "macos")]
+    {
+        let (read_fd, write_fd) = pipe()?;
+        set_cloexec(&read_fd)?;
+        set_cloexec(&write_fd)?;
+        Ok((read_fd, write_fd))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(pipe2(OFlag::O_CLOEXEC)?)
+    }
 }
 
 pub fn posix_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
-    Ok(socketpair(AddressFamily::Unix, SockType::Stream, None, SockFlag::SOCK_CLOEXEC)?)
+    #[cfg(target_os = "macos")]
+    {
+        let (client_fd, server_fd) =
+            socketpair(AddressFamily::Unix, SockType::Stream, None, SockFlag::empty())?;
+        set_cloexec(&client_fd)?;
+        set_cloexec(&server_fd)?;
+        Ok((client_fd, server_fd))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(socketpair(AddressFamily::Unix, SockType::Stream, None, SockFlag::SOCK_CLOEXEC)?)
+    }
 }
 
 fn service_dir() -> Option<PathBuf> {
@@ -106,15 +138,25 @@ fn try_open_existing_service(service_dir: &Path) -> io::Result<Option<SpawnedVir
 fn spawn_transient_virtmgr(virtmgr_path: &OsStr) -> io::Result<SpawnedVirtmgr> {
     let (wait_fd, ready_fd) = posix_pipe()?;
     let (client_fd, server_fd) = posix_socketpair()?;
+    debug_trace(format!(
+        "vmclient: spawning transient virtmgr path={} server_fd={} ready_fd={}",
+        virtmgr_path.to_string_lossy(),
+        server_fd.as_raw_fd(),
+        ready_fd.as_raw_fd()
+    ));
 
     let mut command = Command::new(virtmgr_path);
     command.arg("--rpc-server-fd").arg(format!("{}", server_fd.as_raw_fd()));
     command.arg("--ready-fd").arg(format!("{}", ready_fd.as_raw_fd()));
     command.preserved_fds(vec![server_fd, ready_fd]);
 
-    SharedChild::spawn(&mut command)?;
+    let child = SharedChild::spawn(&mut command)?;
+    drop(command);
+    debug_trace(format!("vmclient: transient virtmgr spawned pid={}", child.id()));
 
+    debug_trace("vmclient: waiting for transient virtmgr ready byte");
     let _ = File::from(wait_fd).read(&mut [0])?;
+    debug_trace("vmclient: transient virtmgr ready byte received");
     Ok(SpawnedVirtmgr { connection: UnixConnection::Bootstrap(client_fd) })
 }
 
@@ -127,14 +169,29 @@ fn spawn_persistent_virtmgr(
     let _ = fs::remove_file(&socket_path);
 
     let (wait_fd, ready_fd) = posix_pipe()?;
+    debug_trace(format!(
+        "vmclient: spawning persistent virtmgr path={} socket_path={} ready_fd={}",
+        virtmgr_path.to_string_lossy(),
+        socket_path.display(),
+        ready_fd.as_raw_fd()
+    ));
     let mut command = Command::new(virtmgr_path);
     command.arg("--rpc-server-path").arg(&socket_path);
     command.arg("--ready-fd").arg(format!("{}", ready_fd.as_raw_fd()));
     command.preserved_fds(vec![ready_fd]);
 
     let child = SharedChild::spawn(&mut command)?;
+    drop(command);
+    debug_trace(format!("vmclient: persistent virtmgr spawned pid={}", child.id()));
+    debug_trace("vmclient: waiting for persistent virtmgr ready byte");
     let _ = File::from(wait_fd).read(&mut [0])?;
+    debug_trace("vmclient: persistent virtmgr ready byte received");
     write_service_state(service_dir, child.id() as i32, &socket_path)?;
+    debug_trace(format!(
+        "vmclient: wrote service state pid={} socket_path={}",
+        child.id(),
+        socket_path.display()
+    ));
 
     Ok(SpawnedVirtmgr { connection: UnixConnection::UnixDomain(socket_path) })
 }
@@ -144,14 +201,18 @@ pub fn spawn_virtmgr(virtmgr_path: &OsStr) -> io::Result<SpawnedVirtmgr> {
         .filter(|path| !path.is_empty())
         .unwrap_or_else(|| virtmgr_path.to_owned());
     let exe = exe_owned.as_os_str();
+    debug_trace(format!("vmclient: resolved virtmgr path={}", exe.to_string_lossy()));
 
     if let Some(service_dir) = service_dir() {
+        debug_trace(format!("vmclient: persistent service mode dir={}", service_dir.display()));
         if let Some(existing) = try_open_existing_service(&service_dir)? {
+            debug_trace("vmclient: reusing existing virtmgr service");
             return Ok(existing);
         }
         return spawn_persistent_virtmgr(exe, &service_dir);
     }
 
+    debug_trace("vmclient: transient service mode");
     spawn_transient_virtmgr(exe)
 }
 

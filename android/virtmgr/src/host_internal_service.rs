@@ -17,12 +17,13 @@ use std::collections::HashSet;
 use std::fs::{create_dir_all, remove_dir_all};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
 
 const HOST_CID_BASE: u32 = 2048;
 
 pub fn global_service() -> Strong<dyn IVirtualizationServiceInternal> {
-    static INSTANCE: LazyLock<Strong<dyn IVirtualizationServiceInternal>> = LazyLock::new(|| {
+    static INSTANCE: Lazy<Strong<dyn IVirtualizationServiceInternal>> = Lazy::new(|| {
         BnVirtualizationServiceInternal::new_binder(
             HostVirtualizationServiceInternal::default(),
             BinderFeatures::default(),

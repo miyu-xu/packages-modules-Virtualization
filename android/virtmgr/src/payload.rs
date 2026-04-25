@@ -40,7 +40,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{metadata, File, OpenOptions};
 #[cfg(not(target_os = "android"))]
-use std::io::copy;
+use std::io::{copy, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -670,6 +670,104 @@ pub fn add_microdroid_system_images(
     os_name: &str,
     vm_config: &mut VirtualMachineRawConfig,
 ) -> Result<()> {
+    #[cfg(not(target_os = "android"))]
+    fn ensure_desktop_microdroid_boot_param(
+        vm_config: &mut VirtualMachineRawConfig,
+        key: &str,
+        value: &str,
+    ) {
+        let param = format!("{key}={value}");
+        if vm_config
+            .params
+            .as_deref()
+            .is_some_and(|params| params.split_whitespace().any(|existing| existing == param))
+        {
+            return;
+        }
+        match vm_config.params.as_mut() {
+            Some(params) if !params.is_empty() => {
+                params.push(' ');
+                params.push_str(&param);
+            }
+            Some(params) => params.push_str(&param),
+            None => vm_config.params = Some(param),
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn ensure_desktop_microdroid_boot_params_from_initrd(
+        vm_config: &mut VirtualMachineRawConfig,
+        initrd_path: &str,
+        keys: &[&str],
+    ) -> Result<()> {
+        const BOOTCONFIG_MAGIC: &[u8] = b"#BOOTCONFIG\n";
+        const INITRD_FOOTER_LEN: u64 =
+            (2 * std::mem::size_of::<u32>() + BOOTCONFIG_MAGIC.len()) as u64;
+
+        let mut initrd = File::open(initrd_path)
+            .with_context(|| format!("Failed to open initrd bootconfig source {}", initrd_path))?;
+        let initrd_len = initrd.metadata()?.len();
+        if initrd_len < INITRD_FOOTER_LEN {
+            bail!("Initrd {} is too small to contain bootconfig footer", initrd_path);
+        }
+
+        let tail_len = initrd_len.min(1024 * 1024) as usize;
+        let tail_offset = initrd_len - tail_len as u64;
+        let mut tail = vec![0u8; tail_len];
+        initrd.seek(SeekFrom::Start(tail_offset))?;
+        initrd.read_exact(&mut tail)?;
+        let Some(magic_pos) =
+            tail.windows(BOOTCONFIG_MAGIC.len()).rposition(|window| window == BOOTCONFIG_MAGIC)
+        else {
+            bail!("Initrd {} is missing the bootconfig footer", initrd_path);
+        };
+        let footer_offset =
+            tail_offset + magic_pos as u64 + BOOTCONFIG_MAGIC.len() as u64 - INITRD_FOOTER_LEN;
+        if footer_offset + INITRD_FOOTER_LEN > initrd_len {
+            bail!("Initrd {} has an invalid bootconfig footer offset", initrd_path);
+        }
+
+        let mut size_bytes = [0u8; std::mem::size_of::<u32>()];
+        initrd.seek(SeekFrom::Start(footer_offset))?;
+        initrd.read_exact(&mut size_bytes)?;
+        let bootconfig_len = u32::from_le_bytes(size_bytes) as u64;
+        if bootconfig_len > footer_offset {
+            bail!(
+                "Initrd {} has an invalid bootconfig footer size {}",
+                initrd_path,
+                bootconfig_len
+            );
+        }
+
+        let bootconfig_offset = footer_offset - bootconfig_len;
+        let mut bootconfig = vec![0u8; bootconfig_len as usize];
+        initrd.seek(SeekFrom::Start(bootconfig_offset))?;
+        initrd.read_exact(&mut bootconfig)?;
+
+        for line in String::from_utf8_lossy(&bootconfig).lines() {
+            let line = line.trim_matches(char::from(0)).trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if !keys.iter().any(|wanted| *wanted == key) {
+                continue;
+            }
+
+            let value = value.trim().trim_matches('"');
+            if value.is_empty() {
+                continue;
+            }
+            ensure_desktop_microdroid_boot_param(vm_config, key, value);
+        }
+
+        Ok(())
+    }
+
     let debug_suffix = match config.debugLevel {
         DebugLevel::NONE => "normal",
         DebugLevel::FULL => "debuggable",
@@ -677,6 +775,41 @@ pub fn add_microdroid_system_images(
     };
     let initrd = format!("/apex/com.android.virt/etc/{os_name}_initrd_{debug_suffix}.img");
     vm_config.initrd = Some(open_parcel_file(Path::new(&initrd), false)?);
+
+    #[cfg(not(target_os = "android"))]
+    if os_name == "microdroid" || os_name.starts_with("microdroid_gki-") {
+        #[cfg(target_arch = "aarch64")]
+        let initrd_host_path = resolve_host_path(Path::new(&initrd));
+        #[cfg(target_arch = "aarch64")]
+        ensure_desktop_microdroid_boot_params_from_initrd(
+            vm_config,
+            initrd_host_path
+                .to_str()
+                .ok_or_else(|| anyhow!("Invalid initrd path {}", initrd_host_path.display()))?,
+            &[
+                "androidboot.vbmeta.size",
+                "androidboot.vbmeta.digest",
+                "androidboot.vbmeta.hash_alg",
+                "androidboot.vbmeta.avb_version",
+                "androidboot.vbmeta.invalidate_on_error",
+                "androidboot.vbmeta.device_state",
+                "androidboot.vbmeta.device",
+            ],
+        )?;
+        #[cfg(target_arch = "aarch64")]
+        ensure_desktop_microdroid_boot_param(vm_config, "androidboot.boot_devices", "10000.pci");
+        ensure_desktop_microdroid_boot_param(vm_config, "androidboot.slot_suffix", "_a");
+        ensure_desktop_microdroid_boot_param(
+            vm_config,
+            "androidboot.vbmeta.device",
+            "/dev/block/by-name/vbmeta_a",
+        );
+        ensure_desktop_microdroid_boot_param(
+            vm_config,
+            "androidboot.vbmeta.device_state",
+            "locked",
+        );
+    }
 
     let mut writable_partitions = vec![Partition {
         label: "vm-instance".to_owned(),

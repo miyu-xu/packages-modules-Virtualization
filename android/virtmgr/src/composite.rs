@@ -19,6 +19,8 @@ use crate::os_compat::AsRawFd;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::Partition::Partition;
 use anyhow::{bail, Context, Error};
 use disk::{create_composite_disk, ImagePartitionType, PartitionInfo};
+#[cfg(target_os = "macos")]
+use std::ffi::CStr;
 #[cfg(windows)]
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -153,6 +155,18 @@ fn path_for_file(file: &File) -> Result<PathBuf, Error> {
     #[cfg(unix)]
     {
         let fd = file.as_raw_fd();
+        #[cfg(target_os = "macos")]
+        {
+            let mut path_buf = [0u8; libc::PATH_MAX as usize];
+            let rc = unsafe { libc::fcntl(fd, libc::F_GETPATH, path_buf.as_mut_ptr()) };
+            if rc != -1 {
+                if let Ok(path) = unsafe { CStr::from_ptr(path_buf.as_ptr().cast()) }.to_str() {
+                    return Ok(PathBuf::from(path));
+                }
+            }
+            return Ok(format!("/dev/fd/{}", fd).into());
+        }
+        #[cfg(not(target_os = "macos"))]
         return Ok(format!("/proc/self/fd/{}", fd).into());
     }
     #[cfg(windows)]

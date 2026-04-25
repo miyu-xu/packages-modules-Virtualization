@@ -91,7 +91,8 @@ use std::ops::Range;
 use crate::os_compat::{AsRawFd, FromRawFd, IntoRawFd};
 use crate::os_compat::pid_t;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak, LazyLock};
+use std::sync::{Arc, Mutex, Weak};
+use once_cell::sync::Lazy;
 use std::sync::Once;
 use vbmeta::VbMetaImage;
 use vmconfig::{VmConfig, get_debug_level, resolve_host_path};
@@ -101,7 +102,6 @@ use zip::ZipArchive;
 pub type Cid = u32;
 
 pub const BINDER_SERVICE_IDENTIFIER: &str = "android.system.virtualizationservice";
-#[cfg(windows)]
 const VIRTMGR_TRACE_FILE: &str = "VIRTMGR_TRACE_FILE";
 
 /// The size of zero.img.
@@ -114,7 +114,6 @@ const ANDROID_VM_INSTANCE_MAGIC: &str = "Android-VM-instance";
 /// Version of the instance image format
 const ANDROID_VM_INSTANCE_VERSION: u16 = 1;
 
-#[cfg(windows)]
 pub(crate) fn debug_trace(message: impl AsRef<str>) {
     let Ok(path) = std::env::var(VIRTMGR_TRACE_FILE) else {
         return;
@@ -124,9 +123,6 @@ pub(crate) fn debug_trace(message: impl AsRef<str>) {
         let _ = writeln!(file, "{}", message.as_ref());
     }
 }
-
-#[cfg(not(windows))]
-pub(crate) fn debug_trace(_message: impl AsRef<str>) {}
 
 const MICRODROID_OS_NAME: &str = "microdroid";
 
@@ -140,19 +136,18 @@ const PARTITION_GRANULARITY_BYTES: u64 = 4096;
 
 const VM_REFERENCE_DT_ON_HOST_PATH: &str = "/proc/device-tree/avf/reference";
 
-pub static GLOBAL_SERVICE: LazyLock<Strong<dyn IVirtualizationServiceInternal>> =
-    LazyLock::new(|| {
-        if cfg!(early) {
-            panic!("Early virtmgr must not connect to VirtualizatinoServiceInternal")
-        } else if cfg!(not(target_os = "android")) {
-            host_internal_service::global_service()
-        } else {
-            wait_for_interface(BINDER_SERVICE_IDENTIFIER)
-                .expect("Could not connect to VirtualizationServiceInternal")
-        }
-    });
-static SUPPORTED_OS_NAMES: LazyLock<HashSet<String>> =
-    LazyLock::new(|| get_supported_os_names().expect("Failed to get list of supported os names"));
+pub static GLOBAL_SERVICE: Lazy<Strong<dyn IVirtualizationServiceInternal>> = Lazy::new(|| {
+    if cfg!(early) {
+        panic!("Early virtmgr must not connect to VirtualizatinoServiceInternal")
+    } else if cfg!(not(target_os = "android")) {
+        host_internal_service::global_service()
+    } else {
+        wait_for_interface(BINDER_SERVICE_IDENTIFIER)
+            .expect("Could not connect to VirtualizationServiceInternal")
+    }
+});
+static SUPPORTED_OS_NAMES: Lazy<HashSet<String>> =
+    Lazy::new(|| get_supported_os_names().expect("Failed to get list of supported os names"));
 
 fn create_or_update_idsig_file(
     input_fd: &ParcelFileDescriptor,
@@ -485,7 +480,7 @@ impl VirtualizationService {
     fn create_early_vm_context(
         &self,
         config: &VirtualMachineConfig,
-    ) -> binder::Result<(VmContext, Cid, PathBuf)> {
+    ) -> binder::Result<(Strong<dyn IGlobalVmContext>, Cid, PathBuf)> {
         let calling_exe_path = format!("/proc/{}/exe", get_calling_pid());
         let link = fs::read_link(&calling_exe_path)
             .context(format!("can't read_link '{calling_exe_path}'"))
@@ -513,6 +508,26 @@ impl VirtualizationService {
         let context = EarlyVmContext::new(cid, temp_dir.clone())
             .context(format!("Can't create early vm contexts for {cid}"))
             .or_service_specific_exception(-1)?;
+        Ok((Strong::new(Box::new(context)), cid, temp_dir))
+    }
+
+    fn create_vm_context(
+        &self,
+        requester_debug_pid: pid_t,
+    ) -> binder::Result<(Strong<dyn IGlobalVmContext>, Cid, PathBuf)> {
+        let num_attempts = if cfg!(target_os = "android") { 5 } else { 64 };
+
+        for _ in 0..num_attempts {
+            let vm_context = GLOBAL_SERVICE.allocateGlobalVmContext(requester_debug_pid)?;
+            let cid = vm_context.getCid()? as Cid;
+            let temp_dir: PathBuf = vm_context.getTemporaryDirectory()?.into();
+            return Ok((vm_context, cid, temp_dir));
+        }
+        Err(anyhow!("Too many attempts to create VM context failed"))
+            .or_service_specific_exception(-1)
+    }
+
+    fn start_vm_service(&self, cid: Cid) -> binder::Result<RpcServer> {
         let service = VirtualMachineService::new_binder(self.state.clone(), cid).as_binder();
 
         // Start VM service listening for connections from the new CID on port=CID.
@@ -525,39 +540,7 @@ impl VirtualizationService {
             FileDescriptorTransportMode::Unix,
         ]);
         vm_server.start();
-        Ok((VmContext::new(Strong::new(Box::new(context)), vm_server), cid, temp_dir))
-    }
-
-    fn create_vm_context(
-        &self,
-        requester_debug_pid: pid_t,
-    ) -> binder::Result<(VmContext, Cid, PathBuf)> {
-        let num_attempts = if cfg!(target_os = "android") { 5 } else { 64 };
-
-        for _ in 0..num_attempts {
-            let vm_context = GLOBAL_SERVICE.allocateGlobalVmContext(requester_debug_pid)?;
-            let cid = vm_context.getCid()? as Cid;
-            let temp_dir: PathBuf = vm_context.getTemporaryDirectory()?.into();
-            let service = VirtualMachineService::new_binder(self.state.clone(), cid).as_binder();
-
-            // Start VM service listening for connections from the new CID on port=CID.
-            let port = cid;
-            match RpcServer::new_vsock(service, cid, port) {
-                Ok(vm_server) => {
-                    vm_server.set_supported_file_descriptor_transport_modes(&[
-                        FileDescriptorTransportMode::None,
-                        FileDescriptorTransportMode::Unix,
-                    ]);
-                    vm_server.start();
-                    return Ok((VmContext::new(vm_context, vm_server), cid, temp_dir));
-                }
-                Err(err) => {
-                    warn!("Could not start RpcServer on port {}: {}", port, err);
-                }
-            }
-        }
-        Err(anyhow!("Too many attempts to create VM context failed"))
-            .or_service_specific_exception(-1)
+        Ok(vm_server)
     }
 
     fn create_vm_internal(
@@ -586,7 +569,7 @@ impl VirtualizationService {
         }
 
         // Allocating VM context checks the MANAGE_VIRTUAL_MACHINE permission.
-        let (vm_context, cid, temporary_directory) = if cfg!(early) {
+        let (global_context, cid, temporary_directory) = if cfg!(early) {
             self.create_early_vm_context(config)?
         } else {
             self.create_vm_context(requester_debug_pid)?
@@ -613,7 +596,9 @@ impl VirtualizationService {
             check_gdb_allowed(config)?;
         }
 
+        debug_trace(format!("virtmgr: create_vm_internal before DT overlay cid={cid}"));
         let device_tree_overlay = maybe_create_device_tree_overlay(config, &temporary_directory)?;
+        debug_trace(format!("virtmgr: create_vm_internal after DT overlay cid={cid}"));
 
         let debug_config = DebugConfig::new(config);
         let ramdump = if !uses_gki_kernel(config) && debug_config.is_ramdump_needed() {
@@ -621,12 +606,14 @@ impl VirtualizationService {
         } else {
             None
         };
+        debug_trace(format!("virtmgr: create_vm_internal after debug config cid={cid}"));
 
         let state = &mut *self.state.lock().unwrap();
         let console_out_fd =
             clone_or_prepare_logger_fd(console_out_fd, format!("Console({})", cid))?;
         let console_in_fd = console_in_fd.map(clone_file).transpose()?;
         let log_fd = clone_or_prepare_logger_fd(log_fd, format!("Log({})", cid))?;
+        debug_trace(format!("virtmgr: create_vm_internal after console/log fds cid={cid}"));
 
         // Counter to generate unique IDs for temporary image files.
         let mut next_temporary_image_id = 0;
@@ -648,6 +635,13 @@ impl VirtualizationService {
             }
         };
         let config = config.as_ref();
+        debug_trace(format!(
+            "virtmgr: create_vm_internal loaded config cid={} name={} protected={} disks={}",
+            cid,
+            config.name,
+            config.protectedVm,
+            config.disks.len()
+        ));
         *is_protected = config.protectedVm;
 
         // Check if partition images are labeled incorrectly. This is to prevent random images
@@ -668,14 +662,22 @@ impl VirtualizationService {
             })
             .try_for_each(check_label_for_partition)
             .or_service_specific_exception(-1)?;
+        debug_trace(format!("virtmgr: create_vm_internal after partition labels cid={cid}"));
 
         // Check if files for payloads and bases are NOT coming from /vendor and /odm, as they may
         // have unstable interfaces.
         // TODO(b/316431494): remove once Treble interfaces are stabilized.
         check_partitions_for_files(config).or_service_specific_exception(-1)?;
+        debug_trace(format!("virtmgr: create_vm_internal after partition files cid={cid}"));
 
         let kernel = maybe_clone_file(&config.kernel)?;
         let initrd = maybe_clone_file(&config.initrd)?;
+        debug_trace(format!(
+            "virtmgr: create_vm_internal after kernel/initrd clone cid={} kernel={} initrd={}",
+            cid,
+            kernel.is_some(),
+            initrd.is_some()
+        ));
 
         if config.protectedVm {
             // In a protected VM, we require custom kernels to come from a trusted source
@@ -684,12 +686,14 @@ impl VirtualizationService {
             // Fail fast with a meaningful error message in case device doesn't support pVMs.
             check_protected_vm_is_supported()?;
         }
+        debug_trace(format!("virtmgr: create_vm_internal after protected-vm checks cid={cid}"));
 
         let zero_filler_path = temporary_directory.join("zero.img");
         write_zero_filler(&zero_filler_path)
             .context("Failed to make composite image")
             .with_log()
             .or_service_specific_exception(-1)?;
+        debug_trace(format!("virtmgr: create_vm_internal after zero filler cid={cid}"));
 
         // Assemble disk images if needed.
         let disks = config
@@ -705,6 +709,11 @@ impl VirtualizationService {
                 )
             })
             .collect::<Result<Vec<DiskFile>, _>>()?;
+        debug_trace(format!(
+            "virtmgr: create_vm_internal after disk assembly cid={} disks={}",
+            cid,
+            disks.len()
+        ));
 
         let (cpus, host_cpu_topology) = match config.cpuTopology {
             CpuTopology::MATCH_HOST => (None, true),
@@ -715,6 +724,7 @@ impl VirtualizationService {
                     .or_service_specific_exception(-1);
             }
         };
+        debug_trace(format!("virtmgr: create_vm_internal after cpu topology cid={cid}"));
 
         let (vfio_devices, dtbo) = if !config.devices.is_empty() {
             let mut set = HashSet::new();
@@ -740,6 +750,12 @@ impl VirtualizationService {
         } else {
             (vec![], None)
         };
+        debug_trace(format!(
+            "virtmgr: create_vm_internal after device/vfio setup cid={} vfio_devices={} dtbo={}",
+            cid,
+            vfio_devices.len(),
+            dtbo.is_some()
+        ));
         let display_config = if cfg!(paravirtualized_devices) {
             config
                 .displayConfig
@@ -760,6 +776,12 @@ impl VirtualizationService {
         } else {
             None
         };
+        debug_trace(format!(
+            "virtmgr: create_vm_internal after display/gpu config cid={} display={} gpu={}",
+            cid,
+            display_config.is_some(),
+            gpu_config.is_some()
+        ));
 
         let input_device_options = if cfg!(paravirtualized_devices) {
             config
@@ -771,6 +793,11 @@ impl VirtualizationService {
         } else {
             vec![]
         };
+        debug_trace(format!(
+            "virtmgr: create_vm_internal after input devices cid={} inputs={}",
+            cid,
+            input_device_options.len()
+        ));
 
         // Create TAP network interface if the VM supports network.
         let tap = if cfg!(network) && config.networkSupported {
@@ -790,6 +817,11 @@ impl VirtualizationService {
         } else {
             None
         };
+        debug_trace(format!(
+            "virtmgr: create_vm_internal after network setup cid={} tap={}",
+            cid,
+            tap.is_some()
+        ));
 
         let audio_config = if cfg!(paravirtualized_devices) {
             config.audioConfig.as_ref().map(AudioConfig::new)
@@ -803,6 +835,12 @@ impl VirtualizationService {
             .map(UsbConfig::new)
             .unwrap_or(Ok(UsbConfig { controller: false }))
             .or_binder_exception(ExceptionCode::BAD_PARCELABLE)?;
+        debug_trace(format!(
+            "virtmgr: create_vm_internal after audio/usb config cid={} audio={} usb_controller={}",
+            cid,
+            audio_config.is_some(),
+            usb_config.controller
+        ));
 
         // Actually start the VM.
         let crosvm_config = CrosvmConfig {
@@ -811,6 +849,7 @@ impl VirtualizationService {
             bootloader: maybe_clone_file(&config.bootloader)?,
             kernel,
             initrd,
+            android_fstab: maybe_open_android_fstab()?,
             disks,
             params: config.params.to_owned(),
             protected: *is_protected,
@@ -845,6 +884,11 @@ impl VirtualizationService {
             no_balloon: config.noBalloon,
             usb_config,
         };
+        debug_trace(format!("virtmgr: create_vm_internal after crosvm config cid={cid}"));
+        debug_trace(format!("virtmgr: create_vm_internal before vm service start cid={cid}"));
+        let vm_server = self.start_vm_service(cid)?;
+        debug_trace(format!("virtmgr: create_vm_internal after vm service start cid={cid}"));
+        let vm_context = VmContext::new(global_context, vm_server);
         debug_trace(format!("virtmgr: create_vm_internal before VmInstance::new cid={cid}"));
         println!("virtmgr: create_vm_internal before VmInstance::new cid={cid}");
         let instance = Arc::new(
@@ -996,6 +1040,13 @@ fn maybe_create_device_tree_overlay(
                 // an empty property in untrusted node in DT. This enables Updatable VMs.
                 untrusted_props.push((cstr!("defer-rollback-protection"), &[]))
             }
+            debug_trace(format!(
+                "virtmgr: dt props cid={} want_updatable={} secretkeeper_supported={} untrusted_props={}",
+                cid,
+                want_updatable,
+                is_secretkeeper_supported(),
+                untrusted_props.len()
+            ));
         }
 
         let device_tree_overlay =
@@ -1017,6 +1068,24 @@ fn maybe_create_device_tree_overlay(
             };
         Ok(device_tree_overlay)
     }
+}
+
+fn maybe_open_android_fstab() -> binder::Result<Option<File>> {
+    let apex_path = resolve_host_path(Path::new("/apex/com.android.virt/etc/fstab.microdroid"));
+    if apex_path.exists() {
+        return Ok(Some(File::open(apex_path).or_service_specific_exception(-1)?));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let repo_fallback =
+            PathBuf::from("packages/modules/Virtualization/build/microdroid/fstab.microdroid");
+        if repo_fallback.exists() {
+            return Ok(Some(File::open(repo_fallback).or_service_specific_exception(-1)?));
+        }
+    }
+
+    Ok(None)
 }
 
 fn write_zero_filler(zero_filler_path: &Path) -> Result<()> {
@@ -2131,7 +2200,7 @@ fn check_config_features(config: &VirtualMachineConfig) -> binder::Result<()> {
     if !cfg!(multi_tenant) {
         check_no_extra_apks(config)?;
     }
-    if !cfg!(debuggable_vms_improvements) {
+    if cfg!(target_os = "android") && !cfg!(debuggable_vms_improvements) {
         check_no_extra_kernel_cmdline_params(config)?;
     }
     Ok(())
@@ -2226,16 +2295,26 @@ impl IVirtualMachineService for VirtualMachineService {
     fn notifyPayloadStarted(&self) -> binder::Result<()> {
         let cid = self.cid;
         debug_trace(format!("virtmgr: notifyPayloadStarted cid={cid}"));
+        info!("virtmgr: notifyPayloadStarted cid={cid}");
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
+            debug_trace(format!("virtmgr: notifyPayloadStarted found vm cid={cid}"));
             info!("VM with CID {} started payload", cid);
-            vm.update_payload_state(PayloadState::Started)
-                .or_binder_exception(ExceptionCode::ILLEGAL_STATE)?;
+            vm.update_payload_state(PayloadState::Started).map_err(|e| {
+                debug_trace(format!(
+                    "virtmgr: notifyPayloadStarted invalid state cid={} err={:?}",
+                    cid, e
+                ));
+                error!("virtmgr: notifyPayloadStarted invalid state cid={} err={:?}", cid, e);
+                e
+            })
+            .or_binder_exception(ExceptionCode::ILLEGAL_STATE)?;
             vm.callbacks.notify_payload_started(cid);
 
             let vm_start_timestamp = vm.vm_metric.lock().unwrap().start_timestamp;
             write_vm_booted_stats(vm.requester_uid as i32, &vm.name, vm_start_timestamp);
             Ok(())
         } else {
+            debug_trace(format!("virtmgr: notifyPayloadStarted unknown cid={cid}"));
             error!("notifyPayloadStarted is called from an unknown CID {}", cid);
             Err(anyhow!("cannot find a VM with CID {}", cid)).or_service_specific_exception(-1)
         }
@@ -2244,13 +2323,23 @@ impl IVirtualMachineService for VirtualMachineService {
     fn notifyPayloadReady(&self) -> binder::Result<()> {
         let cid = self.cid;
         debug_trace(format!("virtmgr: notifyPayloadReady cid={cid}"));
+        info!("virtmgr: notifyPayloadReady cid={cid}");
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
+            debug_trace(format!("virtmgr: notifyPayloadReady found vm cid={cid}"));
             info!("VM with CID {} reported payload is ready", cid);
-            vm.update_payload_state(PayloadState::Ready)
-                .or_binder_exception(ExceptionCode::ILLEGAL_STATE)?;
+            vm.update_payload_state(PayloadState::Ready).map_err(|e| {
+                debug_trace(format!(
+                    "virtmgr: notifyPayloadReady invalid state cid={} err={:?}",
+                    cid, e
+                ));
+                error!("virtmgr: notifyPayloadReady invalid state cid={} err={:?}", cid, e);
+                e
+            })
+            .or_binder_exception(ExceptionCode::ILLEGAL_STATE)?;
             vm.callbacks.notify_payload_ready(cid);
             Ok(())
         } else {
+            debug_trace(format!("virtmgr: notifyPayloadReady unknown cid={cid}"));
             error!("notifyPayloadReady is called from an unknown CID {}", cid);
             Err(anyhow!("cannot find a VM with CID {}", cid)).or_service_specific_exception(-1)
         }
@@ -2259,13 +2348,23 @@ impl IVirtualMachineService for VirtualMachineService {
     fn notifyPayloadFinished(&self, exit_code: i32) -> binder::Result<()> {
         let cid = self.cid;
         debug_trace(format!("virtmgr: notifyPayloadFinished cid={cid} exit_code={exit_code}"));
+        info!("virtmgr: notifyPayloadFinished cid={cid} exit_code={exit_code}");
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
+            debug_trace(format!("virtmgr: notifyPayloadFinished found vm cid={cid} exit_code={exit_code}"));
             info!("VM with CID {} finished payload", cid);
-            vm.update_payload_state(PayloadState::Finished)
-                .or_binder_exception(ExceptionCode::ILLEGAL_STATE)?;
+            vm.update_payload_state(PayloadState::Finished).map_err(|e| {
+                debug_trace(format!(
+                    "virtmgr: notifyPayloadFinished invalid state cid={} err={:?}",
+                    cid, e
+                ));
+                error!("virtmgr: notifyPayloadFinished invalid state cid={} err={:?}", cid, e);
+                e
+            })
+            .or_binder_exception(ExceptionCode::ILLEGAL_STATE)?;
             vm.callbacks.notify_payload_finished(cid, exit_code);
             Ok(())
         } else {
+            debug_trace(format!("virtmgr: notifyPayloadFinished unknown cid={cid}"));
             error!("notifyPayloadFinished is called from an unknown CID {}", cid);
             Err(anyhow!("cannot find a VM with CID {}", cid)).or_service_specific_exception(-1)
         }
@@ -2277,13 +2376,26 @@ impl IVirtualMachineService for VirtualMachineService {
             "virtmgr: notifyError cid={cid} code={:?} message={}",
             error_code, message
         ));
+        info!("virtmgr: notifyError cid={cid} code={:?} message={}", error_code, message);
         if let Some(vm) = self.state.lock().unwrap().get_vm(cid) {
+            debug_trace(format!(
+                "virtmgr: notifyError found vm cid={} code={:?} message={}",
+                cid, error_code, message
+            ));
             info!("VM with CID {} encountered an error", cid);
-            vm.update_payload_state(PayloadState::Finished)
-                .or_binder_exception(ExceptionCode::ILLEGAL_STATE)?;
+            vm.update_payload_state(PayloadState::Finished).map_err(|e| {
+                debug_trace(format!(
+                    "virtmgr: notifyError invalid state cid={} err={:?}",
+                    cid, e
+                ));
+                error!("virtmgr: notifyError invalid state cid={} err={:?}", cid, e);
+                e
+            })
+            .or_binder_exception(ExceptionCode::ILLEGAL_STATE)?;
             vm.callbacks.notify_error(cid, error_code, message);
             Ok(())
         } else {
+            debug_trace(format!("virtmgr: notifyError unknown cid={cid}"));
             error!("notifyError is called from an unknown CID {}", cid);
             Err(anyhow!("cannot find a VM with CID {}", cid)).or_service_specific_exception(-1)
         }
@@ -2291,6 +2403,7 @@ impl IVirtualMachineService for VirtualMachineService {
 
     #[cfg(target_os = "android")]
     fn getSecretkeeper(&self) -> binder::Result<Strong<dyn ISecretkeeper>> {
+        debug_trace(format!("virtmgr: getSecretkeeper cid={}", self.cid));
         if !is_secretkeeper_supported() {
             return Err(StatusCode::NAME_NOT_FOUND)?;
         }
@@ -2300,6 +2413,7 @@ impl IVirtualMachineService for VirtualMachineService {
 
     #[cfg(not(target_os = "android"))]
     fn getSecretkeeper(&self) -> binder::Result<Strong<dyn ISecretkeeper>> {
+        debug_trace(format!("virtmgr: getSecretkeeper unsupported cid={}", self.cid));
         Err(StatusCode::NAME_NOT_FOUND)?
     }
 
