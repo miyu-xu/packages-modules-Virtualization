@@ -14,15 +14,9 @@
 
 //! Functions for creating a composite disk image.
 
-#[cfg(unix)]
-use crate::os_compat::AsRawFd;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::Partition::Partition;
 use anyhow::{bail, Context, Error};
 use disk::{create_composite_disk, ImagePartitionType, PartitionInfo};
-#[cfg(target_os = "macos")]
-use std::ffi::CStr;
-#[cfg(windows)]
-use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 
@@ -48,13 +42,7 @@ fn read_exact_at_compat(file: &File, buf: &mut [u8], offset: u64) -> std::io::Re
         Ok(())
     }
 }
-#[cfg(windows)]
-use std::os::windows::ffi::OsStringExt;
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
 use zerocopy::FromZeroes;
@@ -152,38 +140,8 @@ fn convert_partitions(partitions: &[Partition]) -> Result<(Vec<PartitionInfo>, V
 }
 
 fn path_for_file(file: &File) -> Result<PathBuf, Error> {
-    #[cfg(unix)]
-    {
-        let fd = file.as_raw_fd();
-        #[cfg(target_os = "macos")]
-        {
-            let mut path_buf = [0u8; libc::PATH_MAX as usize];
-            let rc = unsafe { libc::fcntl(fd, libc::F_GETPATH, path_buf.as_mut_ptr()) };
-            if rc != -1 {
-                if let Ok(path) = unsafe { CStr::from_ptr(path_buf.as_ptr().cast()) }.to_str() {
-                    return Ok(PathBuf::from(path));
-                }
-            }
-            return Ok(format!("/dev/fd/{}", fd).into());
-        }
-        #[cfg(not(target_os = "macos"))]
-        return Ok(format!("/proc/self/fd/{}", fd).into());
-    }
-    #[cfg(windows)]
-    {
-        let h = file.as_raw_handle();
-        let mut buf = vec![0u16; 32768];
-        let len =
-            unsafe { GetFinalPathNameByHandleW(h as _, buf.as_mut_ptr(), buf.len() as u32, 0) };
-        if len == 0 {
-            bail!(
-                "GetFinalPathNameByHandleW failed for composite input: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        let os_str = OsString::from_wide(&buf[..len as usize]);
-        Ok(PathBuf::from(os_str))
-    }
+    crate::platform::host().path_for_fd(file)
+        .map_err(|e| anyhow::anyhow!("path_for_file: {e}"))
 }
 
 /// Find the size of the partition image in the given file by parsing the header.

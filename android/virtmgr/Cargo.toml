@@ -64,6 +64,7 @@ android_system_virtualizationmaintenance = { path = "../virtualizationservice/ai
 android_hardware_security_secretkeeper = { path = "../virtualizationservice/aidl/android/hardware/security/secretkeeper" }
 android_hardware_security_authgraph = { path = "../virtualizationservice/aidl/android/hardware/security/authgraph" }
 avf_features = { path = "../../libs/avf_features" }
+desktop_host = { path = "../../libs/desktop_host" }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", features = ["fs", "process", "signal", "socket", "user"] }

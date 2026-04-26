@@ -16,6 +16,7 @@
 
 mod aidl;
 mod atom;
+mod bridge;
 mod composite;
 mod crosvm;
 mod debug_config;
@@ -25,6 +26,7 @@ mod host_internal_service;
 mod non_windows_main;
 mod os_compat;
 mod payload;
+pub mod platform;
 mod selinux;
 mod vsock_transport;
 
@@ -80,5 +82,6 @@ pub fn get_calling_uid() -> u32 {
 }
 
 fn main() {
+    platform::init();
     non_windows_main::run();
 }

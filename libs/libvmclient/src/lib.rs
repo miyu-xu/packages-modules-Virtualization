@@ -379,7 +379,7 @@ pub unsafe extern "C" fn get_virtualization_service(
                 let _ = vs;
                 if let Some(cb) = cb {
                     let msg = CString::new(
-                        "get_virtualization_service is not supported on Windows host builds",
+                        "get_virtualization_service is not supported on desktop host builds",
                     )
                     .unwrap();
                     unsafe { cb(libc::ENOTSUP, msg.as_ptr(), ctx) };

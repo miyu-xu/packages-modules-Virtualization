@@ -83,20 +83,7 @@ fn get_duration(vm_start_timestamp: Option<SystemTime>) -> Duration {
 // This matches how crosvm determines the number of logical cores.
 // For telemetry purposes only.
 pub(crate) fn get_num_cpus() -> Option<usize> {
-    #[cfg(unix)]
-    {
-        // SAFETY: Only integer constants passed back and forth.
-        let ret = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
-        if ret > 0 {
-            ret.try_into().ok()
-        } else {
-            None
-        }
-    }
-    #[cfg(windows)]
-    {
-        std::thread::available_parallelism().ok().map(|n| n.get())
-    }
+    crate::platform::host().num_cpus()
 }
 
 /// Write the stats of VMCreation to statsd

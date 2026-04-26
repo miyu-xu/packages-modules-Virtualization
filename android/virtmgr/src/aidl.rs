@@ -1537,33 +1537,10 @@ struct CompositeImageFilenames {
 fn check_permission(perm: &str) -> binder::Result<()> {
     #[cfg(not(target_os = "android"))]
     {
-        if let Some(allowlist) = parse_allowlist_from_env_or_file(
-            "VIRTMGR_MOCK_PERMISSION_ALLOWLIST",
-            "VIRTMGR_MOCK_PERMISSION_ALLOWLIST_FILE",
-        )
-        .or_service_specific_exception(-1)?
-        {
-            if allowlist.contains(perm) {
-                return Ok(());
-            }
-            return Err(anyhow!("mock permission provider denied: {perm}"))
-                .or_binder_exception(ExceptionCode::SECURITY);
-        }
-        let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if strict_parity {
-            return Err(anyhow!(
-                "VIRTMGR_STRICT_PARITY=1: permission checks require Android permission service"
-            ))
-            .or_binder_exception(ExceptionCode::UNSUPPORTED_OPERATION);
-        }
-        static WARN_ONCE: Once = Once::new();
-        WARN_ONCE.call_once(|| {
-            warn!("Host runtime mode: permission checks are bypassed (Android permission service unavailable)");
-        });
-        let _ = perm;
-        return Ok(());
+        return crate::platform::host()
+            .permission()
+            .check_permission(perm)
+            .or_service_specific_exception(-1);
     }
     #[cfg(target_os = "android")]
     {
@@ -1614,34 +1591,6 @@ fn is_safe_raw_partition(label: &str) -> bool {
     label == "vm-instance"
 }
 
-#[cfg(not(target_os = "android"))]
-fn parse_allowlist_from_env_or_file(
-    env_csv_key: &str,
-    env_file_key: &str,
-) -> Result<Option<HashSet<String>>> {
-    if let Ok(csv) = std::env::var(env_csv_key) {
-        let parsed: HashSet<String> = csv
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
-        return Ok(Some(parsed));
-    }
-    if let Ok(path) = std::env::var(env_file_key) {
-        let content =
-            std::fs::read_to_string(&path).with_context(|| format!("Failed to read {path}"))?;
-        let parsed: HashSet<String> = content
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.starts_with('#'))
-            .map(ToOwned::to_owned)
-            .collect();
-        return Ok(Some(parsed));
-    }
-    Ok(None)
-}
-
 /// Check that a file SELinux label is acceptable.
 ///
 /// We only want to allow code in a VM to be sourced from places that apps, and the
@@ -1668,27 +1617,10 @@ fn check_label_is_allowed(context: &SeContext) -> Result<()> {
 fn check_label_for_partition(partition: &Partition) -> Result<()> {
     #[cfg(not(target_os = "android"))]
     {
-        if let Some(allowlist) = parse_allowlist_from_env_or_file(
-            "VIRTMGR_MOCK_SELINUX_LABEL_ALLOWLIST",
-            "VIRTMGR_MOCK_SELINUX_LABEL_ALLOWLIST_FILE",
-        )? {
-            if allowlist.contains(&partition.label) {
-                return Ok(());
-            }
-            bail!("mock SELinux provider denied partition label {}", partition.label);
-        }
-        let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if strict_parity {
-            bail!("VIRTMGR_STRICT_PARITY=1: SELinux label checks require Android SELinux runtime");
-        }
-        static WARN_ONCE: Once = Once::new();
-        WARN_ONCE.call_once(|| {
-            warn!("Host runtime mode: SELinux label checks are bypassed");
-        });
-        let _ = partition;
-        return Ok(());
+        return crate::platform::host()
+            .selinux()
+            .check_label_for_partition(&partition.label)
+            .with_context(|| format!("Partition {} invalid", &partition.label));
     }
     #[cfg(target_os = "android")]
     {
@@ -1710,27 +1642,10 @@ fn check_label_for_kernel_files(kernel: &Option<File>, initrd: &Option<File>) ->
 fn check_label_for_file(file: &File, name: &str) -> Result<()> {
     #[cfg(not(target_os = "android"))]
     {
-        if let Some(allowlist) = parse_allowlist_from_env_or_file(
-            "VIRTMGR_MOCK_SELINUX_LABEL_ALLOWLIST",
-            "VIRTMGR_MOCK_SELINUX_LABEL_ALLOWLIST_FILE",
-        )? {
-            if allowlist.contains(name) {
-                return Ok(());
-            }
-            bail!("mock SELinux provider denied file label {}", name);
-        }
-        let strict_parity = std::env::var("VIRTMGR_STRICT_PARITY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if strict_parity {
-            bail!("VIRTMGR_STRICT_PARITY=1: SELinux label checks require Android SELinux runtime");
-        }
-        static WARN_ONCE: Once = Once::new();
-        WARN_ONCE.call_once(|| {
-            warn!("Host runtime mode: SELinux label checks are bypassed");
-        });
-        let _ = (file, name);
-        return Ok(());
+        return crate::platform::host()
+            .selinux()
+            .check_file_label(file, name)
+            .with_context(|| format!("{} file invalid", name));
     }
     #[cfg(target_os = "android")]
     {
@@ -1841,7 +1756,7 @@ impl IVirtualMachine for VirtualMachine {
         {
             self.instance
                 .prepare_vsock_connection(port)
-                .context("Failed to ask crosvm to prepare Windows host-initiated vsock connection")
+                .context("Failed to ask crosvm to prepare host-initiated vsock connection")
                 .or_service_specific_exception(-1)?;
             let handle = crate::vsock_transport::connect(self.instance.cid, port)
                 .context("Failed to connect named pipe (Windows vsock mapping)")

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Launch and manage `crosvm` on Windows hosts using path-based arguments and a named pipe for VM
+//! Launch and manage `crosvm` on Windows using path-based arguments and a named pipe for VM
 //! control (`--socket`). Requires a working `crosvm.exe` (see `VIRTMGR_CROSVM_PATH`).
 
 use crate::aidl::{debug_trace, remove_temporary_files, Cid, VirtualMachineCallbacks};
@@ -46,7 +46,6 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,8 +55,19 @@ use std::time::Instant;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 use vm_control::{BalloonControlCommand, VmRequest, VmResponse};
-use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::ptr;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Storage::FileSystem::{
+    GetFinalPathNameByHandleW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED,
+};
 use windows_sys::Win32::System::Console::{GetConsoleMode, GetNumberOfConsoleInputEvents};
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_ACCESS_INBOUND, PIPE_READMODE_BYTE,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
+};
+
+
 
 type VfioDevice = Strong<dyn IBoundDevice>;
 
@@ -78,7 +88,7 @@ const CONSOLE_HVC0: &str = "hvc0";
 const CONSOLE_TTYS0: &str = "ttyS0";
 
 static BOOT_HANGUP_TIMEOUT: once_cell::sync::Lazy<Duration> =
-    // Windows host bringup is slower than the Unix AVF path because guest->host Binder RPC,
+    // Windows bringup is slower than the Unix AVF path because guest->host Binder RPC,
     // composite disk assembly, and the userspace virtio-vsock bridge all sit on compatibility
     // layers instead of native Android plumbing.
     once_cell::sync::Lazy::new(|| Duration::from_secs(120));
@@ -127,6 +137,112 @@ fn crosvm_stdio_capture_enabled() -> bool {
     std::env::var_os(VIRTMGR_CAPTURE_CROSVM_STDIO)
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
+}
+
+/// Create a named pipe server for guest console output.
+/// Returns the pipe path (for crosvm's `--serial`) and the server read handle.
+/// Crosvm opens the client end via `CreateFile` when it processes `type=file,path=\\.\pipe\...`.
+#[cfg(windows)]
+fn create_console_named_pipe(cid: Cid) -> Result<(String, OwnedHandle)> {
+    let pipe_name = format!(r"\\.\pipe\virtmgr_console_{cid}");
+    let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let handle = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,     // max one instance
+            65536, // out buffer (crosvm writes into the pipe)
+            65536, // in buffer (we read from the pipe)
+            0,     // default timeout
+            ptr::null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        bail!(
+            "CreateNamedPipeW failed for console pipe: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    Ok((pipe_name, unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) }))
+}
+
+/// Create a named pipe server for guest console input.
+/// Returns the pipe path (for crosvm's `,input=` serial arg) and the server write handle.
+/// Crosvm opens the client end and reads from this pipe; we write keyboard input to the server end.
+#[cfg(windows)]
+fn create_console_input_pipe(cid: Cid) -> Result<(String, OwnedHandle)> {
+    let pipe_name = format!(r"\\.\pipe\virtmgr_console_input_{cid}");
+    let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let handle = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,     // max one instance
+            65536, // out buffer (we write into the pipe)
+            65536, // in buffer (crosvm reads from the pipe)
+            0,     // default timeout
+            ptr::null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        bail!(
+            "CreateNamedPipeW failed for console input pipe: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    Ok((pipe_name, unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) }))
+}
+
+/// Read loop for a named pipe console: accepts the connection, reads data,
+/// and appends to a shared buffer. Runs until the pipe is disconnected.
+#[cfg(windows)]
+fn console_pipe_read_loop(
+    pipe_handle: OwnedHandle,
+    buffer: Arc<Mutex<Vec<u8>>>,
+) {
+    let raw = pipe_handle.as_raw_handle() as _;
+
+    // Accept the client connection (crosvm opens our pipe via CreateFile)
+    let connected = unsafe { ConnectNamedPipe(raw, ptr::null_mut()) };
+    if connected == 0 {
+        let err = std::io::Error::last_os_error();
+        // ERROR_PIPE_CONNECTED (535) means the client already connected
+        if err.raw_os_error() != Some(535) {
+            warn!("ConnectNamedPipe for console pipe failed: {err}");
+            return;
+        }
+    }
+    info!("Console named pipe connected");
+
+    let mut buf = [0u8; 65536];
+    loop {
+        let mut total = 0u32;
+        let rc = unsafe {
+            windows_sys::Win32::Storage::FileSystem::ReadFile(
+                raw,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut total,
+                ptr::null_mut(),
+            )
+        };
+        if rc == 0 {
+            // Pipe disconnected or error — crosvm closed its end
+            break;
+        }
+        if total > 0 {
+            buffer.lock().unwrap().extend_from_slice(&buf[..total as usize]);
+        }
+    }
+    info!("Console named pipe closed");
 }
 
 fn format_serial_out_arg(path: Option<File>) -> Result<String> {
@@ -343,10 +459,17 @@ impl VmState {
 
             debug_trace(format!("virtmgr: before run_vm cid={}", instance.cid));
             eprintln!("virtmgr: before run_vm cid={}", instance.cid);
+            let console_pipes = instance.start_console_pipe();
+            let (console_pipe_path, console_input_pipe_path) = match console_pipes {
+                Some((out, inp)) => (Some(out), inp),
+                None => (None, None),
+            };
             let (child, keepalive) = run_vm(
                 config,
                 &instance.temporary_directory,
                 &instance.crosvm_control_socket_path,
+                console_pipe_path,
+                console_input_pipe_path,
             )?;
             debug_trace(format!("virtmgr: after run_vm cid={} child={}", instance.cid, child.id()));
             eprintln!("virtmgr: after run_vm cid={} child={}", instance.cid, child.id());
@@ -417,6 +540,14 @@ pub struct VmInstance {
     /// the composite image; crosvm opens by path).
     keepalive_indirect_files: Mutex<Vec<File>>,
     host_vsock_tcp_bridges: Mutex<HashMap<u16, Arc<AtomicBool>>>,
+    #[cfg(windows)]
+    console_output_buffer: Arc<Mutex<Vec<u8>>>,
+    #[cfg(windows)]
+    console_reader: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(windows)]
+    console_input_pipe: Mutex<Option<OwnedHandle>>,
+    #[cfg(windows)]
+    console_input_pipe_path: Mutex<Option<String>>,
 }
 
 impl fmt::Display for VmInstance {
@@ -464,6 +595,10 @@ impl VmInstance {
             requester_uid_name,
             keepalive_indirect_files: Mutex::new(Vec::new()),
             host_vsock_tcp_bridges: Mutex::new(HashMap::new()),
+            console_output_buffer: Arc::new(Mutex::new(Vec::new())),
+            console_reader: Mutex::new(None),
+            console_input_pipe: Mutex::new(None),
+            console_input_pipe_path: Mutex::new(None),
         };
         info!("{} created", &instance);
         Ok(instance)
@@ -493,6 +628,116 @@ impl VmInstance {
 
     pub fn remember_host_console_name(&self, host_console_name: &str) {
         *self.host_console_name.lock().unwrap() = Some(host_console_name.to_owned());
+    }
+
+    /// Create a named pipe for guest console output and start a reader thread.
+    /// Returns the pipe path for use in crosvm serial arguments, or None if pipe creation fails.
+    fn start_console_pipe(&self) -> Option<(String, Option<String>)> {
+        // Output pipe: crosvm writes serial output, we read from it
+        let (out_pipe_path, out_pipe_handle) = match create_console_named_pipe(self.cid) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to create console named pipe: {e:#}; falling back to file-backed console");
+                return None;
+            }
+        };
+
+        let buf = self.console_output_buffer.clone();
+        let reader = thread::Builder::new()
+            .name(format!("virtmgr-console-reader-{}", self.cid))
+            .spawn(move || {
+                console_pipe_read_loop(out_pipe_handle, buf);
+            });
+
+        let out_path = match reader {
+            Ok(handle) => {
+                *self.console_reader.lock().unwrap() = Some(handle);
+                info!("Console output pipe started: {out_pipe_path}");
+                out_pipe_path
+            }
+            Err(e) => {
+                warn!("Failed to spawn console reader thread: {e}; falling back to file-backed console");
+                return None;
+            }
+        };
+
+        // Input pipe: we write keyboard input, crosvm reads from it
+        let in_result = create_console_input_pipe(self.cid);
+        let in_path = match in_result {
+            Ok((path, handle)) => {
+                // Spawn a thread to accept the connection on the input pipe.
+                // Crosvm's serial init opens the pipe for reading; ConnectNamedPipe
+                // completes the named pipe handshake. The raw handle is Copy so we
+                // can pass it to the thread while keeping OwnedHandle on VmInstance.
+                let raw = handle.as_raw_handle() as _;
+                thread::Builder::new()
+                    .name(format!("virtmgr-console-input-conn-{}", self.cid))
+                    .spawn(move || {
+                        let connected = unsafe { ConnectNamedPipe(raw, ptr::null_mut()) };
+                        if connected == 0 {
+                            let err = std::io::Error::last_os_error();
+                            if err.raw_os_error() != Some(535) {
+                                warn!("ConnectNamedPipe for console input pipe failed: {err}");
+                                return;
+                            }
+                        }
+                        info!("Console input pipe connected");
+                        // Keep thread alive (crosvm owns the client end)
+                        loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+                    })
+                    .ok();
+                *self.console_input_pipe.lock().unwrap() = Some(handle);
+                *self.console_input_pipe_path.lock().unwrap() = Some(path.clone());
+                info!("Console input pipe created: {path}");
+                Some(path)
+            }
+            Err(e) => {
+                warn!("Failed to create console input pipe: {e:#}; console input will be unavailable");
+                None
+            }
+        };
+
+        Some((out_path, in_path))
+    }
+
+    /// Read buffered console output, up to `max_len` bytes. Clears the buffer after reading.
+    pub fn read_console(&self, max_len: usize) -> Vec<u8> {
+        let mut buf = self.console_output_buffer.lock().unwrap();
+        let len = buf.len().min(max_len);
+        let data: Vec<u8> = buf.drain(..len).collect();
+        data
+    }
+
+    /// Write data to guest console input via the bidirectional named pipe.
+    /// Returns the number of bytes written.
+    pub fn write_console(&self, data: &[u8]) -> std::io::Result<usize> {
+        let pipe_guard = self.console_input_pipe.lock().unwrap();
+        let Some(ref handle) = *pipe_guard else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "console input pipe not available",
+            ));
+        };
+
+        let raw = handle.as_raw_handle() as _;
+        let mut written = 0u32;
+        let rc = unsafe {
+            windows_sys::Win32::Storage::FileSystem::WriteFile(
+                raw,
+                data.as_ptr() as _,
+                data.len() as u32,
+                &mut written,
+                ptr::null_mut(),
+            )
+        };
+        if rc == 0 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "console input pipe write failed",
+            ))
+        } else {
+            Ok(written as usize)
+        }
     }
 
     fn monitor_vm_exit(&self, child: Arc<SharedChild>, _vfio_devices: Vec<VfioDevice>) {
@@ -691,7 +936,7 @@ impl VmInstance {
         }
         if std::fs::metadata(&ramdump_path)?.len() > 0 {
             info!(
-                "Ramdump at {:?} (tombstoned upload is not available on Windows host)",
+                "Ramdump at {:?} (tombstoned upload is not available on this host)",
                 ramdump_path
             );
         }
@@ -827,31 +1072,9 @@ fn bridge_tcp_client_to_guest_vsock(
     let handle = crate::vsock_transport::connect(cid, guest_port).with_context(|| {
         format!("failed to connect guest vsock pipe for cid={cid} port={guest_port}")
     })?;
-    let pipe_file = File::from(handle);
-    let mut pipe_reader = pipe_file.try_clone().context("failed to clone guest vsock pipe")?;
-    let mut pipe_writer = pipe_file;
-    let mut tcp_reader = tcp.try_clone().context("failed to clone TCP stream")?;
-    let mut tcp_writer = tcp;
-
-    let host_to_guest = thread::spawn(move || -> io::Result<u64> {
-        let copied = io::copy(&mut tcp_reader, &mut pipe_writer)?;
-        let _ = pipe_writer.flush();
-        Ok(copied)
-    });
-    let guest_to_host = thread::spawn(move || -> io::Result<u64> {
-        let copied = io::copy(&mut pipe_reader, &mut tcp_writer)?;
-        let _ = tcp_writer.shutdown(Shutdown::Write);
-        Ok(copied)
-    });
-
-    let host_to_guest_result =
-        host_to_guest.join().map_err(|_| anyhow!("host_to_guest bridge thread panicked"))?;
-    let guest_to_host_result =
-        guest_to_host.join().map_err(|_| anyhow!("guest_to_host bridge thread panicked"))?;
-
-    host_to_guest_result.context("tcp->guest copy failed")?;
-    guest_to_host_result.context("guest->tcp copy failed")?;
-    Ok(())
+    let guest = File::from(handle);
+    crate::bridge::bridge_connection(tcp, guest)
+        .map_err(|e| anyhow::anyhow!("bridge_connection failed: {e}"))
 }
 
 fn make_control_pipe_path(cid: Cid) -> PathBuf {
@@ -901,6 +1124,8 @@ fn run_vm(
     mut config: CrosvmConfig,
     temporary_directory: &Path,
     crosvm_control_socket_path: &Path,
+    console_pipe_path: Option<String>,
+    console_input_pipe_path: Option<String>,
 ) -> Result<(SharedChild, Vec<File>), Error> {
     validate_config(&config)?;
     validate_windows_host(&config)?;
@@ -988,13 +1213,24 @@ fn run_vm(
         command.arg("--gdb").arg(gdb_port.to_string());
     }
 
-    let console_out_arg = format_serial_out_arg(config.console_out_fd.take())?;
-    let console_in_arg = config
-        .console_in_fd
-        .take()
-        .map(|fd| add_path(fd).map(|p| format!(",input={p}")))
-        .transpose()?
-        .unwrap_or_default();
+    // If named pipes were created for the console, use them instead of file paths.
+    // Output pipe enables real-time console reading via `read_console()`.
+    // Input pipe enables keyboard input via `write_console()` (Phase B).
+    let console_out_arg = if let Some(ref pipe_path) = console_pipe_path {
+        format!("type=file,path={pipe_path}")
+    } else {
+        format_serial_out_arg(config.console_out_fd.take())?
+    };
+    let console_in_arg = if let Some(ref input_pipe_path) = console_input_pipe_path {
+        format!(",input={input_pipe_path}")
+    } else {
+        config
+            .console_in_fd
+            .take()
+            .map(|fd| add_path(fd).map(|p| format!(",input={p}")))
+            .transpose()?
+            .unwrap_or_default()
+    };
     let log_arg = format_serial_out_arg(config.log_fd.take())?;
 
     let failure_path = temporary_directory.join("vm_failure_serial.txt");

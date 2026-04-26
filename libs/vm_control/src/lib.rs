@@ -1,7 +1,7 @@
 //! VM control IPC for host-side virtmgr.
 //!
 //! On Unix targets we use a stub that returns `ENOTSUP` for balloon stats (matching Android when
-//! the balloon is unavailable). On Windows hosts the client can delegate to the `crosvm` CLI for
+//! the balloon is unavailable). On Windows the client can delegate to the `crosvm` CLI for
 //! suspend/resume and balloon adjustment when `VIRTMGR_CROSVM_PATH` points at a working binary.
 
 use std::path::Path;

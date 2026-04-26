@@ -1491,33 +1491,10 @@ fn bridge_tcp_client_to_guest_vsock(
     guest_port: u32,
     tcp: TcpStream,
 ) -> Result<(), Error> {
-    let stream = crate::vsock_transport::connect(cid, guest_port).with_context(|| {
+    let guest = crate::vsock_transport::connect(cid, guest_port).with_context(|| {
         format!("failed to connect guest vsock for cid={cid} port={guest_port}")
     })?;
-    let mut guest_reader = unsafe { File::from_raw_fd(stream.into_raw_fd()) };
-    let mut guest_writer =
-        guest_reader.try_clone().context("failed to clone guest vsock stream")?;
-    let mut tcp_reader = tcp.try_clone().context("failed to clone TCP stream")?;
-    let mut tcp_writer = tcp;
-
-    let host_to_guest = thread::spawn(move || -> io::Result<u64> {
-        let copied = io::copy(&mut tcp_reader, &mut guest_writer)?;
-        guest_writer.flush()?;
-        Ok(copied)
-    });
-    let guest_to_host = thread::spawn(move || -> io::Result<u64> {
-        let copied = io::copy(&mut guest_reader, &mut tcp_writer)?;
-        let _ = tcp_writer.shutdown(Shutdown::Write);
-        Ok(copied)
-    });
-
-    host_to_guest
-        .join()
-        .map_err(|_| anyhow!("host_to_guest bridge thread panicked"))?
-        .context("tcp->guest copy failed")?;
-    guest_to_host
-        .join()
-        .map_err(|_| anyhow!("guest_to_host bridge thread panicked"))?
-        .context("guest->tcp copy failed")?;
-    Ok(())
+    let guest = unsafe { File::from_raw_fd(guest.into_raw_fd()) };
+    crate::bridge::bridge_connection(tcp, guest)
+        .map_err(|e| anyhow::anyhow!("bridge_connection failed: {e}"))
 }
