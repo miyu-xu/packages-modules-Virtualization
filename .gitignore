@@ -1,9 +1,11 @@
 apkdmverity/target/
 zipfuse/target/
 policy
-zipfuse/target/
 Cargo.lock
 .DS_Store
 android/virtmgr/target/
 android/vm/target/
 libs/libvmclient/target/
+
+# Cargo build output is generated locally and must never be published.
+**/target/
