@@ -818,6 +818,18 @@ impl VmInstance {
                 while running.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((tcp, _remote)) => {
+                            // Darwin inherits O_NONBLOCK from the listening socket. The bridge
+                            // uses blocking io::copy, so leaving the accepted stream nonblocking
+                            // truncates ADB after the first temporarily empty read (typically just
+                            // after the CNXN handshake). Make the data socket blocking explicitly;
+                            // Linux does not inherit the flag, but this keeps the contract portable.
+                            if let Err(err) = tcp.set_nonblocking(false) {
+                                error!(
+                                    "Failed to make host bridge stream blocking for cid={} host_port={} guest_port={}: {}",
+                                    cid, host_port, guest_port, err
+                                );
+                                continue;
+                            }
                             thread::spawn(move || {
                                 if let Err(err) =
                                     bridge_tcp_client_to_guest_vsock(cid, guest_port, tcp)

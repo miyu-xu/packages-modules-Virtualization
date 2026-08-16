@@ -15,9 +15,8 @@
 //! Command to run a VM.
 
 use crate::create_partition::command_create_partition;
-use crate::{get_service, RunAppConfig, RunCustomVmConfig, RunMicrodroidConfig};
+use crate::{get_service, ConnectedService, RunAppConfig, RunCustomVmConfig, RunMicrodroidConfig};
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
-    IVirtualizationService::IVirtualizationService,
     PartitionType::PartitionType,
     VirtualMachineAppConfig::{
         CustomConfig::CustomConfig, DebugLevel::DebugLevel, Payload::Payload,
@@ -41,9 +40,8 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, FromRawFd};
 use std::path::{Path, PathBuf};
-#[cfg(not(target_os = "android"))]
 use std::time::Duration;
-use vmclient::{ErrorCode, VmInstance};
+use vmclient::{DeathReason, ErrorCode, VmInstance};
 use vmconfig::{get_debug_level, open_parcel_file, resolve_host_path, VmConfig};
 use zip::ZipArchive;
 
@@ -136,9 +134,21 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
     println!("vm: got virtualization service");
     let apk = File::open(&config.apk).context("Failed to open APK file")?;
 
-    let extra_apks = match config.config_path.as_deref() {
+    let declared_extra_apks = match config.config_path.as_deref() {
         Some(path) => parse_extra_apk_list(&config.apk, path)?,
         None => config.extra_apks().to_vec(),
+    };
+    let extra_apks = if config.extra_apk_overrides.is_empty() {
+        declared_extra_apks
+    } else {
+        if config.extra_apk_overrides.len() != declared_extra_apks.len() {
+            bail!(
+                "Found {} extra apks in the payload config, but there are {} managed overrides",
+                declared_extra_apks.len(),
+                config.extra_apk_overrides.len()
+            )
+        }
+        config.extra_apk_overrides.clone()
     };
 
     if extra_apks.len() != config.extra_idsigs.len() {
@@ -222,6 +232,10 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
 
     let extra_idsig_files: Result<Vec<_>, _> = config.extra_idsigs.iter().map(File::open).collect();
     let extra_idsig_fds = extra_idsig_files?.into_iter().map(ParcelFileDescriptor::new).collect();
+    let extra_apk_override_files: Result<Vec<_>, _> =
+        config.extra_apk_overrides.iter().map(File::open).collect();
+    let extra_apk_override_fds =
+        extra_apk_override_files?.into_iter().map(ParcelFileDescriptor::new).collect();
 
     let payload = if let Some(config_path) = config.config_path {
         if config.payload_binary_name.is_some() {
@@ -301,9 +315,10 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
         osName: os_name,
         hugePages: config.common.hugepages,
         boostUclamp: config.common.boost_uclamp,
+        extraApksOverride: extra_apk_override_fds,
     });
     run(
-        service.as_ref(),
+        &service,
         &vm_config,
         &payload_config_str,
         config.debug.console.as_ref().map(|p| p.as_ref()),
@@ -393,7 +408,7 @@ pub fn command_run(config: RunCustomVmConfig) -> Result<(), Error> {
     vm_config.boostUclamp = config.common.boost_uclamp;
     let service = get_service()?;
     run(
-        service.as_ref(),
+        &service,
         &VirtualMachineConfig::RawConfig(vm_config),
         &format!("{:?}", &config.config),
         config.debug.console.as_ref().map(|p| p.as_ref()),
@@ -416,7 +431,7 @@ fn state_to_str(vm_state: VirtualMachineState) -> &'static str {
 }
 
 fn run(
-    service: &dyn IVirtualizationService,
+    service: &ConnectedService,
     config: &VirtualMachineConfig,
     payload_config: &str,
     console_out_path: Option<&Path>,
@@ -436,8 +451,9 @@ fn run(
     };
     let callback = Box::new(Callback {});
     println!("vm: before VmInstance::create");
-    let vm = VmInstance::create(service, config, console_out, console_in, log, Some(callback))
-        .context("Failed to create VM")?;
+    let vm =
+        VmInstance::create(service.as_ref(), config, console_out, console_in, log, Some(callback))
+            .context("Failed to create VM")?;
     println!("vm: after VmInstance::create");
     #[cfg(not(target_os = "android"))]
     if let Some(host_console_name) = host_console_name {
@@ -479,9 +495,23 @@ fn run(
 
     // Wait until the VM or VirtualizationService dies. If we just returned immediately then the
     // IVirtualMachine Binder object would be dropped and the VM would be killed.
+    #[cfg(unix)]
+    let death_reason = loop {
+        if let Some(reason) = vm.wait_for_death_with_timeout(Duration::from_millis(100)) {
+            break reason;
+        }
+        if matches!(service.transient_process_alive(), Some(false)) {
+            break DeathReason::VirtualizationServiceDied;
+        }
+    };
+    #[cfg(not(unix))]
     let death_reason = vm.wait_for_death();
     println!("VM ended: {:?}", death_reason);
-    Ok(())
+    if death_reason == DeathReason::Shutdown {
+        Ok(())
+    } else {
+        bail!("VM ended unexpectedly: {death_reason:?}")
+    }
 }
 
 fn parse_extra_apk_list(apk: &Path, config_path: &str) -> Result<Vec<PathBuf>, Error> {

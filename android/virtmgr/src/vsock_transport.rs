@@ -16,8 +16,8 @@
 //! - **Linux / Android**: AF_VSOCK via the `vsock` crate.
 //! - **Windows (host)**: a named pipe client, using the same naming scheme as
 //!   `platform/namedpipe_vsock.h` (`NamedPipeVsockAddress`): `\\.\pipe\binder_rpc_vsock_{cid}_{port}`.
-//! - **macOS (host)**: UDS at `/tmp/binder_rpc_vsock_{cid}_{port}.sock`, matching
-//!   `frameworks/native/libs/binder/platform/macos_uds_vsock_path.cpp`.
+//! - **macOS (host)**: crosvm host-connect UDS at `/tmp/bscp_crosvm_vsock_{cid}.sock`, followed by
+//!   the versioned `HDVS` handshake selecting the guest port.
 
 use binder::ParcelFileDescriptor;
 
@@ -30,6 +30,8 @@ use vsock::VsockStream;
 
 #[cfg(target_os = "macos")]
 use std::fs::File;
+#[cfg(target_os = "macos")]
+use std::io::Write as _;
 #[cfg(target_os = "macos")]
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 #[cfg(target_os = "macos")]
@@ -47,7 +49,8 @@ use std::ptr;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_READMODE_BYTE};
@@ -57,11 +60,10 @@ pub fn named_pipe_path_for_vsock(cid: u32, port: u32) -> String {
     format!(r"\\.\pipe\binder_rpc_vsock_{cid}_{port}")
 }
 
-/// UDS path for macOS vsock emulation — keep in sync with `binderRpcVsockHostPath` in
-/// `macos_uds_vsock_path.cpp`.
+/// Host-initiated UDS exposed by crosvm's macOS virtio-vsock device.
 #[cfg(target_os = "macos")]
-pub fn uds_path_for_vsock_emulation(cid: u32, port: u32) -> String {
-    format!("/tmp/binder_rpc_vsock_{cid}_{port}.sock")
+pub fn uds_path_for_vsock_emulation(cid: u32, _port: u32) -> String {
+    format!("/tmp/bscp_crosvm_vsock_{cid}.sock")
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -77,7 +79,15 @@ pub fn into_parcel_file_descriptor(stream: VsockStream) -> ParcelFileDescriptor 
 
 #[cfg(target_os = "macos")]
 pub fn connect(cid: u32, port: u32) -> std::io::Result<UnixStream> {
-    UnixStream::connect(uds_path_for_vsock_emulation(cid, port))
+    const HOST_CONNECT_MAGIC: &[u8; 4] = b"HDVS";
+    const HOST_CONNECT_VERSION: u32 = 1;
+    let mut stream = UnixStream::connect(uds_path_for_vsock_emulation(cid, port))?;
+    let mut header = [0_u8; 12];
+    header[..4].copy_from_slice(HOST_CONNECT_MAGIC);
+    header[4..8].copy_from_slice(&HOST_CONNECT_VERSION.to_be_bytes());
+    header[8..12].copy_from_slice(&port.to_be_bytes());
+    stream.write_all(&header)?;
+    Ok(stream)
 }
 
 #[cfg(target_os = "macos")]
@@ -102,7 +112,7 @@ pub fn connect(cid: u32, port: u32) -> std::io::Result<OwnedHandle> {
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             ptr::null(),
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
             0,
         )
     };

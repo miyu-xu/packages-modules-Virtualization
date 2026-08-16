@@ -107,7 +107,6 @@ fn debug_trace(message: impl AsRef<str>) {
     }
 }
 
-
 #[cfg(windows)]
 fn ensure_winsock_init() -> io::Result<()> {
     static INIT: OnceLock<io::Result<()>> = OnceLock::new();
@@ -336,6 +335,8 @@ fn file_from_connect_vsock_pfd(pfd: ParcelFileDescriptor) -> File {
 pub struct VirtualizationService {
     #[cfg(unix)]
     connection: spawn_unix::UnixConnection,
+    #[cfg(unix)]
+    transient_process: Option<spawn_unix::TransientVirtmgr>,
     #[cfg(windows)]
     rpc_port: u32,
     #[cfg(windows)]
@@ -367,7 +368,11 @@ pub unsafe extern "C" fn get_virtualization_service(
         Ok(vs) => {
             #[cfg(unix)]
             {
-                match vs.connection {
+                let VirtualizationService { connection, transient_process } = vs;
+                if let Some(process) = transient_process {
+                    process.detach();
+                }
+                match connection {
                     spawn_unix::UnixConnection::Bootstrap(client_fd) => client_fd.into_raw_fd(),
                     spawn_unix::UnixConnection::UnixDomain(path) => {
                         UnixStream::connect(path).map(|stream| stream.into_raw_fd()).unwrap_or(-1)
@@ -431,7 +436,10 @@ impl VirtualizationService {
         #[cfg(unix)]
         {
             let spawned = spawn_unix::spawn_virtmgr(virtmgr_path)?;
-            Ok(VirtualizationService { connection: spawned.connection })
+            Ok(VirtualizationService {
+                connection: spawned.connection,
+                transient_process: spawned.transient_process,
+            })
         }
         #[cfg(windows)]
         {
@@ -442,6 +450,13 @@ impl VirtualizationService {
                 terminate_on_drop: spawned.terminate_on_drop,
             })
         }
+    }
+
+    /// Returns the liveness of the transient virtmgr process, or `None` when connected to a
+    /// separately managed persistent service.
+    #[cfg(unix)]
+    pub fn transient_process_alive(&self) -> Option<bool> {
+        self.transient_process.as_ref().and_then(spawn_unix::TransientVirtmgr::is_alive)
     }
 
     /// Connects to the VirtualizationService AIDL service.

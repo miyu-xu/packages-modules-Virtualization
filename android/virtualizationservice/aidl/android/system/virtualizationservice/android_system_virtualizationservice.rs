@@ -2979,6 +2979,7 @@ pub mod aidl {
             pub r#customConfig: Option<crate::mangled::_7_android_6_system_21_virtualizationservice_23_VirtualMachineAppConfig_12_CustomConfig>,
             pub r#hugePages: bool,
             pub r#boostUclamp: bool,
+            pub r#extraApksOverride: Vec<binder::ParcelFileDescriptor>,
           }
           impl Default for r#VirtualMachineAppConfig {
             fn default() -> Self {
@@ -2999,6 +3000,7 @@ pub mod aidl {
                 r#customConfig: Default::default(),
                 r#hugePages: false,
                 r#boostUclamp: false,
+                r#extraApksOverride: Default::default(),
               }
             }
           }
@@ -3024,6 +3026,7 @@ pub mod aidl {
                 subparcel.write(&self.r#customConfig)?;
                 subparcel.write(&self.r#hugePages)?;
                 subparcel.write(&self.r#boostUclamp)?;
+                subparcel.write(&self.r#extraApksOverride)?;
                 Ok(())
               })
             }
@@ -3076,6 +3079,9 @@ pub mod aidl {
                 }
                 if subparcel.has_more_data() {
                   self.r#boostUclamp = subparcel.read()?;
+                }
+                if subparcel.has_more_data() {
+                  self.r#extraApksOverride = subparcel.read()?;
                 }
                 Ok(())
               })

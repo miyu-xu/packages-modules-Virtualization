@@ -1275,15 +1275,30 @@ fn load_app_config(
             vm_payload_config =
                 load_vm_payload_config_from_file(&apk_file, config_path.as_str())
                     .with_context(|| format!("Couldn't read config from {}", config_path))?;
-            extra_apk_files = vm_payload_config
-                .extra_apks
-                .iter()
-                .enumerate()
-                .map(|(i, apk)| {
-                    File::open(PathBuf::from(&apk.path))
-                        .with_context(|| format!("Failed to open extra apk #{i} {}", apk.path))
-                })
-                .collect::<Result<_>>()?;
+            if config.extraApksOverride.is_empty() {
+                extra_apk_files = vm_payload_config
+                    .extra_apks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, apk)| {
+                        File::open(PathBuf::from(&apk.path))
+                            .with_context(|| format!("Failed to open extra apk #{i} {}", apk.path))
+                    })
+                    .collect::<Result<_>>()?;
+            } else {
+                if config.extraApksOverride.len() != vm_payload_config.extra_apks.len() {
+                    bail!(
+                        "payload config has {} extra apks, but app config has {} managed overrides",
+                        vm_payload_config.extra_apks.len(),
+                        config.extraApksOverride.len()
+                    );
+                }
+                extra_apk_files = config
+                    .extraApksOverride
+                    .iter()
+                    .map(clone_file)
+                    .collect::<binder::Result<_>>()?;
+            }
         }
         Payload::PayloadConfig(payload_config) => {
             vm_payload_config = create_vm_payload_config(payload_config)?;

@@ -90,6 +90,11 @@ impl ConnectedService {
     fn as_ref(&self) -> &dyn IVirtualizationService {
         self.service.as_ref()
     }
+
+    #[cfg(unix)]
+    fn transient_process_alive(&self) -> Option<bool> {
+        self._virtmgr.transient_process_alive()
+    }
 }
 
 #[derive(Args, Default)]
@@ -296,6 +301,11 @@ pub struct RunAppConfig {
     /// Paths to extra idsig files.
     #[arg(long = "extra-idsig")]
     extra_idsigs: Vec<PathBuf>,
+
+    /// Caller-managed extra APK paths that override host paths declared by --config-path.
+    /// The count must exactly match the payload config and each file is passed by descriptor.
+    #[arg(long = "extra-apk-override", requires = "config_path")]
+    extra_apk_overrides: Vec<PathBuf>,
 }
 
 impl RunAppConfig {

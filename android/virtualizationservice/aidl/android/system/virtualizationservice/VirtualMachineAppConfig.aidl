@@ -145,4 +145,11 @@ parcelable VirtualMachineAppConfig {
 
     /** Enable boost UClamp for less variance during testing/benchmarking */
     boolean boostUclamp;
+
+    /**
+     * Optional caller-opened extra APKs for a configPath payload. When non-empty, the list must
+     * exactly match extra_apks declared by the payload config and is used instead of opening the
+     * config's host paths. This keeps desktop ports from granting arbitrary host-path access.
+     */
+    List<ParcelFileDescriptor> extraApksOverride;
 }

@@ -22,8 +22,8 @@ use crate::traits::*;
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{FromRawHandle, OwnedHandle};
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
 use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_READMODE_BYTE};
 
@@ -80,7 +80,7 @@ impl VsockConnector for WindowsDesktopHost {
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                windows_sys::Win32::Storage::FileSystem::GENERIC_READ | windows_sys::Win32::Storage::FileSystem::GENERIC_WRITE,
+                GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -103,7 +103,7 @@ impl VsockConnector for WindowsDesktopHost {
                 std::io::Error::last_os_error()
             ));
         }
-        let owned_handle = unsafe { OwnedHandle::from_raw_handle(handle as isize) };
+        let owned_handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
         Ok(binder::ParcelFileDescriptor::new(owned_handle))
     }
 }

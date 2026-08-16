@@ -31,7 +31,7 @@ use android_system_virtualizationservice_internal::aidl::android::system::virtua
 use android_system_virtualizationservice_internal::aidl::android::system::virtualizationservice_internal::IBoundDevice::IBoundDevice;
 use android_system_virtualmachineservice::aidl::android::system::virtualmachineservice::IVirtualMachineService::IVirtualMachineService;
 use binder::Strong;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use rpcbinder::RpcServer;
 use semver::Version;
 use semver::VersionReq;
@@ -59,12 +59,12 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::ptr;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFinalPathNameByHandleW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED,
+    GetFinalPathNameByHandleW, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_INBOUND,
+    PIPE_ACCESS_OUTBOUND,
 };
 use windows_sys::Win32::System::Console::{GetConsoleMode, GetNumberOfConsoleInputEvents};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_ACCESS_INBOUND, PIPE_READMODE_BYTE,
-    PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 
 
@@ -207,6 +207,7 @@ fn create_console_input_pipe(cid: Cid) -> Result<(String, OwnedHandle)> {
 fn console_pipe_read_loop(
     pipe_handle: OwnedHandle,
     buffer: Arc<Mutex<Vec<u8>>>,
+    mut output: Option<File>,
 ) {
     let raw = pipe_handle.as_raw_handle() as _;
 
@@ -228,7 +229,7 @@ fn console_pipe_read_loop(
         let rc = unsafe {
             windows_sys::Win32::Storage::FileSystem::ReadFile(
                 raw,
-                buf.as_mut_ptr(),
+                buf.as_mut_ptr() as _,
                 buf.len() as u32,
                 &mut total,
                 ptr::null_mut(),
@@ -239,7 +240,15 @@ fn console_pipe_read_loop(
             break;
         }
         if total > 0 {
-            buffer.lock().unwrap().extend_from_slice(&buf[..total as usize]);
+            let bytes = &buf[..total as usize];
+            let write_result = output
+                .as_mut()
+                .map(|file| file.write_all(bytes).and_then(|()| file.flush()));
+            if let Some(Err(error)) = write_result {
+                warn!("Failed to persist guest console output: {error}");
+                output = None;
+            }
+            buffer.lock().unwrap().extend_from_slice(bytes);
         }
     }
     info!("Console named pipe closed");
@@ -459,7 +468,11 @@ impl VmState {
 
             debug_trace(format!("virtmgr: before run_vm cid={}", instance.cid));
             eprintln!("virtmgr: before run_vm cid={}", instance.cid);
-            let console_pipes = instance.start_console_pipe();
+            let console_output = config
+                .console_out_fd
+                .as_ref()
+                .and_then(|file| file.try_clone().ok());
+            let console_pipes = instance.start_console_pipe(console_output);
             let (console_pipe_path, console_input_pipe_path) = match console_pipes {
                 Some((out, inp)) => (Some(out), inp),
                 None => (None, None),
@@ -632,7 +645,7 @@ impl VmInstance {
 
     /// Create a named pipe for guest console output and start a reader thread.
     /// Returns the pipe path for use in crosvm serial arguments, or None if pipe creation fails.
-    fn start_console_pipe(&self) -> Option<(String, Option<String>)> {
+    fn start_console_pipe(&self, output: Option<File>) -> Option<(String, Option<String>)> {
         // Output pipe: crosvm writes serial output, we read from it
         let (out_pipe_path, out_pipe_handle) = match create_console_named_pipe(self.cid) {
             Ok(v) => v,
@@ -646,7 +659,7 @@ impl VmInstance {
         let reader = thread::Builder::new()
             .name(format!("virtmgr-console-reader-{}", self.cid))
             .spawn(move || {
-                console_pipe_read_loop(out_pipe_handle, buf);
+                console_pipe_read_loop(out_pipe_handle, buf, output);
             });
 
         let out_path = match reader {
@@ -661,43 +674,11 @@ impl VmInstance {
             }
         };
 
-        // Input pipe: we write keyboard input, crosvm reads from it
-        let in_result = create_console_input_pipe(self.cid);
-        let in_path = match in_result {
-            Ok((path, handle)) => {
-                // Spawn a thread to accept the connection on the input pipe.
-                // Crosvm's serial init opens the pipe for reading; ConnectNamedPipe
-                // completes the named pipe handshake. The raw handle is Copy so we
-                // can pass it to the thread while keeping OwnedHandle on VmInstance.
-                let raw = handle.as_raw_handle() as _;
-                thread::Builder::new()
-                    .name(format!("virtmgr-console-input-conn-{}", self.cid))
-                    .spawn(move || {
-                        let connected = unsafe { ConnectNamedPipe(raw, ptr::null_mut()) };
-                        if connected == 0 {
-                            let err = std::io::Error::last_os_error();
-                            if err.raw_os_error() != Some(535) {
-                                warn!("ConnectNamedPipe for console input pipe failed: {err}");
-                                return;
-                            }
-                        }
-                        info!("Console input pipe connected");
-                        // Keep thread alive (crosvm owns the client end)
-                        loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
-                    })
-                    .ok();
-                *self.console_input_pipe.lock().unwrap() = Some(handle);
-                *self.console_input_pipe_path.lock().unwrap() = Some(path.clone());
-                info!("Console input pipe created: {path}");
-                Some(path)
-            }
-            Err(e) => {
-                warn!("Failed to create console input pipe: {e:#}; console input will be unavailable");
-                None
-            }
-        };
-
-        Some((out_path, in_path))
+        // The output pipe is server-owned by virtmgr and crosvm connects as its writer.
+        // Do not also create a named input pipe here: crosvm's dual-pipe console path owns
+        // both server endpoints, so mixing the two ownership models races with ERROR_PIPE_BUSY.
+        // Console input, when supplied, remains backed by `config.console_in_fd`.
+        Some((out_path, None))
     }
 
     /// Read buffered console output, up to `max_len` bytes. Clears the buffer after reading.
@@ -1006,6 +987,16 @@ impl VmInstance {
                 while running.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((tcp, remote)) => {
+                            // The listener must stay nonblocking so it can observe shutdown, while
+                            // each accepted data stream is consumed by blocking io::copy. Set the
+                            // child stream explicitly instead of relying on platform inheritance.
+                            if let Err(err) = tcp.set_nonblocking(false) {
+                                error!(
+                                    "Failed to make host bridge stream blocking for cid={} host_port={} guest_port={}: {}",
+                                    cid, host_port, guest_port, err
+                                );
+                                continue;
+                            }
                             debug_trace(format!(
                                 "virtmgr: host bridge accepted cid={} host_port={} guest_port={} remote={}",
                                 cid, host_port, guest_port, remote
@@ -1134,10 +1125,12 @@ fn run_vm(
     debug_trace(format!("virtmgr: run_vm binary={:?} cid={}", binary, config.cid));
     eprintln!("virtmgr: run_vm binary={:?} cid={}", binary, config.cid);
     let mut command = Command::new(&binary);
+    let log_level = std::env::var("VIRTMGR_CROSVM_LOG_LEVEL")
+        .unwrap_or_else(|_| "info,disk=warn".to_owned());
     command
         .arg("--extended-status")
         .arg("--log-level")
-        .arg("info,disk=warn")
+        .arg(log_level)
         .arg("run")
         .arg("--disable-sandbox")
         .arg("--cid")
@@ -1262,8 +1255,10 @@ fn run_vm(
             format!("type=file,path={}", console1_path.to_string_lossy()),
             format!("type=file,path={}", log3_path.to_string_lossy()),
         )
+    } else if console_input_device == CONSOLE_TTYS0 {
+        (console_out_arg.clone(), "type=sink".to_owned(), log_arg.clone())
     } else {
-        (console_out_arg.clone(), console_out_arg.clone(), log_arg.clone())
+        ("type=sink".to_owned(), console_out_arg.clone(), log_arg.clone())
     };
 
     command.arg(format!(

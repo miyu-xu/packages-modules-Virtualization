@@ -10,18 +10,19 @@ use std::os::fd::{AsFd, RawFd};
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use crate::debug_trace;
 use command_fds::CommandFdExt;
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 #[cfg(not(target_os = "macos"))]
 use nix::fcntl::OFlag;
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::signal;
 use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
-use nix::unistd::{pipe, Pid};
 #[cfg(not(target_os = "macos"))]
 use nix::unistd::pipe2;
+use nix::unistd::{pipe, Pid};
 use shared_child::SharedChild;
 
 const VIRTMGR_SERVICE_DIR_ENV: &str = "VIRTMGR_SERVICE_DIR";
@@ -34,8 +35,50 @@ pub enum UnixConnection {
     UnixDomain(PathBuf),
 }
 
+pub struct TransientVirtmgr {
+    child: Option<SharedChild>,
+}
+
+impl TransientVirtmgr {
+    fn new(child: SharedChild) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Returns whether the transient service process is still running.
+    pub fn is_alive(&self) -> Option<bool> {
+        self.child.as_ref().and_then(|child| child.try_wait().ok().map(|status| status.is_none()))
+    }
+
+    /// Transfers process lifetime to the returned bootstrap connection.
+    ///
+    /// The C ABI exposes only the connection fd and cannot retain this guard. Preserve its
+    /// historical behavior there; Rust callers keep the guard and terminate their transient
+    /// service deterministically.
+    pub fn detach(mut self) {
+        self.child.take();
+    }
+}
+
+impl Drop for TransientVirtmgr {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let pid = Pid::from_raw(child.id() as i32);
+        let _ = signal::kill(pid, signal::Signal::SIGTERM);
+        if !matches!(child.wait_timeout(Duration::from_secs(2)), Ok(Some(_))) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 pub struct SpawnedVirtmgr {
     pub connection: UnixConnection,
+    pub transient_process: Option<TransientVirtmgr>,
 }
 
 fn set_cloexec<F: AsFd>(fd: &F) -> io::Result<()> {
@@ -129,7 +172,10 @@ fn try_open_existing_service(service_dir: &Path) -> io::Result<Option<SpawnedVir
         return Ok(None);
     };
     if process_alive(pid) && socket_path.exists() {
-        return Ok(Some(SpawnedVirtmgr { connection: UnixConnection::UnixDomain(socket_path) }));
+        return Ok(Some(SpawnedVirtmgr {
+            connection: UnixConnection::UnixDomain(socket_path),
+            transient_process: None,
+        }));
     }
     remove_service_artifacts(service_dir);
     Ok(None)
@@ -157,7 +203,10 @@ fn spawn_transient_virtmgr(virtmgr_path: &OsStr) -> io::Result<SpawnedVirtmgr> {
     debug_trace("vmclient: waiting for transient virtmgr ready byte");
     let _ = File::from(wait_fd).read(&mut [0])?;
     debug_trace("vmclient: transient virtmgr ready byte received");
-    Ok(SpawnedVirtmgr { connection: UnixConnection::Bootstrap(client_fd) })
+    Ok(SpawnedVirtmgr {
+        connection: UnixConnection::Bootstrap(client_fd),
+        transient_process: Some(TransientVirtmgr::new(child)),
+    })
 }
 
 fn spawn_persistent_virtmgr(
@@ -193,7 +242,10 @@ fn spawn_persistent_virtmgr(
         socket_path.display()
     ));
 
-    Ok(SpawnedVirtmgr { connection: UnixConnection::UnixDomain(socket_path) })
+    Ok(SpawnedVirtmgr {
+        connection: UnixConnection::UnixDomain(socket_path),
+        transient_process: None,
+    })
 }
 
 pub fn spawn_virtmgr(virtmgr_path: &OsStr) -> io::Result<SpawnedVirtmgr> {

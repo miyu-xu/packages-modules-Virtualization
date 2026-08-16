@@ -29,6 +29,7 @@ use binder::ParcelFileDescriptor;
 use log::{info, warn};
 use microdroid_metadata::{ApexPayload, ApkPayload, Metadata, PayloadConfig, PayloadMetadata};
 use microdroid_payload_config::{ApexConfig, VmPayloadConfig};
+#[cfg(target_os = "android")]
 use once_cell::sync::OnceCell;
 use packagemanager_aidl::aidl::android::content::pm::{
     IPackageManagerNative::IPackageManagerNative, StagedApexInfo,
@@ -102,33 +103,42 @@ struct ApexInfo {
 
 impl ApexInfoList {
     /// Loads ApexInfoList
-    fn load() -> Result<&'static ApexInfoList> {
-        static INSTANCE: OnceCell<ApexInfoList> = OnceCell::new();
-        INSTANCE.get_or_try_init(|| {
+    fn load(temporary_directory: &Path) -> Result<ApexInfoList> {
+        #[cfg(target_os = "android")]
+        {
+            static INSTANCE: OnceCell<ApexInfoList> = OnceCell::new();
+            return INSTANCE.get_or_try_init(Self::load_from_xml).cloned();
+        }
+        #[cfg(not(target_os = "android"))]
+        {
             let apex_info_list_path = resolve_host_path(Path::new(APEX_INFO_LIST_PATH));
-            #[cfg(windows)]
             if !apex_info_list_path.exists() {
-                return Ok(ApexInfoList { list: vec![] });
+                return load_desktop_factory_apex_info_list(temporary_directory);
             }
-            let apex_info_list = File::open(&apex_info_list_path)
-                .with_context(|| format!("Failed to open {}", apex_info_list_path.display()))?;
-            let mut apex_info_list: ApexInfoList = from_reader(apex_info_list)
-                .with_context(|| format!("Failed to parse {}", apex_info_list_path.display()))?;
+            Self::load_from_xml()
+        }
+    }
 
-            // For active APEXes, we run derive_classpath and parse its output to see if it
-            // contributes to the classpath(s). (This allows us to handle any new classpath env
-            // vars seamlessly.)
-            if cfg!(target_os = "android") && !cfg!(early) {
-                let classpath_vars = run_derive_classpath()?;
-                let classpath_apexes = find_apex_names_in_classpath(&classpath_vars)?;
+    fn load_from_xml() -> Result<ApexInfoList> {
+        let apex_info_list_path = resolve_host_path(Path::new(APEX_INFO_LIST_PATH));
+        let apex_info_list = File::open(&apex_info_list_path)
+            .with_context(|| format!("Failed to open {}", apex_info_list_path.display()))?;
+        let mut apex_info_list: ApexInfoList = from_reader(apex_info_list)
+            .with_context(|| format!("Failed to parse {}", apex_info_list_path.display()))?;
 
-                for apex_info in apex_info_list.list.iter_mut() {
-                    apex_info.has_classpath_jar = classpath_apexes.contains(&apex_info.name);
-                }
+        // For active APEXes, we run derive_classpath and parse its output to see if it
+        // contributes to the classpath(s). (This allows us to handle any new classpath env
+        // vars seamlessly.)
+        if cfg!(target_os = "android") && !cfg!(early) {
+            let classpath_vars = run_derive_classpath()?;
+            let classpath_apexes = find_apex_names_in_classpath(&classpath_vars)?;
+
+            for apex_info in apex_info_list.list.iter_mut() {
+                apex_info.has_classpath_jar = classpath_apexes.contains(&apex_info.name);
             }
+        }
 
-            Ok(apex_info_list)
-        })
+        Ok(apex_info_list)
     }
 
     // Override apex info with the staged one
@@ -181,7 +191,7 @@ impl ApexInfo {
 }
 
 struct PackageManager {
-    apex_info_list: &'static ApexInfoList,
+    apex_info_list: ApexInfoList,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -291,6 +301,88 @@ fn resolve_windows_staged_disk_image_path(
 }
 
 #[cfg(not(target_os = "android"))]
+fn load_desktop_factory_apex_info_list(temporary_directory: &Path) -> Result<ApexInfoList> {
+    let roots = [
+        (resolve_host_path(Path::new("/system/apex")), Path::new("/system/apex")),
+        (resolve_host_path(Path::new("/system_ext/apex")), Path::new("/system_ext/apex")),
+    ];
+    let cache = temporary_directory.join("factory-apexes");
+    std::fs::create_dir_all(&cache)
+        .with_context(|| format!("Failed to create {}", cache.display()))?;
+    let mut seen = HashSet::new();
+    let mut list = Vec::new();
+
+    for (root, logical_root) in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        let mut entries = std::fs::read_dir(&root)
+            .with_context(|| format!("Failed to read {}", root.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let source = entry.path();
+            let extension = source.extension().and_then(OsStr::to_str);
+            if extension != Some("apex") && extension != Some("capex") {
+                continue;
+            }
+            let module = source
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| anyhow!("Invalid factory APEX path {}", source.display()))?;
+            if module.is_empty()
+                || !module
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                bail!("Invalid factory APEX module name in {}", source.display());
+            }
+            if !seen.insert(module.to_owned()) {
+                bail!("Duplicate active factory APEX module {module}");
+            }
+            let path = if extension == Some("capex") {
+                let output = cache.join(format!("{module}.apex"));
+                extract_original_apex_if_needed(&source, &output)?;
+                output
+            } else {
+                source.clone()
+            };
+            list.push(ApexInfo {
+                name: module.to_owned(),
+                version: 0,
+                path: path.clone(),
+                has_classpath_jar: false,
+                // CAPEX files are expanded into a per-VM temporary directory.  The expanded
+                // file therefore has a new timestamp on every launch, but
+                // `last_update_seconds` is part of Microdroid's persisted payload identity.
+                // Use the immutable product artifact timestamp so an unchanged product can
+                // restart the same instance without being rejected as a changed APEX set.
+                last_update_seconds: last_updated(&source)?,
+                is_factory: true,
+                is_active: true,
+                provide_shared_apex_libs: false,
+                preinstalled_path: logical_root.join(entry.file_name()),
+            });
+        }
+    }
+
+    if list.is_empty() {
+        bail!("Desktop Microdroid product contains no factory APEX files");
+    }
+    // Directory enumeration order is not a cross-platform contract.  Partition numbering is
+    // derived from this list, so keep the final order stable even if roots or scan code change.
+    list.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.preinstalled_path.cmp(&right.preinstalled_path))
+    });
+    Ok(ApexInfoList { list })
+}
+
+#[cfg(not(target_os = "android"))]
 fn collect_windows_staged_apexes() -> Result<Vec<StagedApexInfo>> {
     let mut out = load_mock_staged_apex_json()?;
 
@@ -369,8 +461,8 @@ fn collect_windows_staged_apexes() -> Result<Vec<StagedApexInfo>> {
 }
 
 impl PackageManager {
-    fn new() -> Result<Self> {
-        let apex_info_list = ApexInfoList::load()?;
+    fn new(temporary_directory: &Path) -> Result<Self> {
+        let apex_info_list = ApexInfoList::load(temporary_directory)?;
         Ok(Self { apex_info_list })
     }
 
@@ -494,7 +586,7 @@ fn make_payload_disk(
         );
     }
 
-    let pm = PackageManager::new()?;
+    let pm = PackageManager::new(temporary_directory)?;
     let apex_list = pm.get_apex_list(vm_payload_config.prefer_staged)?;
 
     // collect APEXes from config
